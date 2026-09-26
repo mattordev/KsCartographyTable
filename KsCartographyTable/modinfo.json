@@ -9,8 +9,8 @@
         "mattordev"
     ],
     "description": "Unofficial performance-fix build of K's Cartography Table. Replaces the official archive.",
-    "networkVersion": "2.0.6",
-    "version": "2.0.6",
+    "networkVersion": "2.0.7",
+    "version": "2.0.7",
     "side" : "Universal",
     "requiredOnClient": true,
     "requiredOnServer": true,
