@@ -42,12 +42,15 @@ public class KsCartographyTableModSystem(bool disableCommands = false, bool disa
     {
         base.Start(api);
         CoreAPI = api;
-        api.RegisterBlockEntityClass(Mod?.Info?.ModID + ".cartography-table-entity", typeof(BlockEntityCartographyTable));
-        api.RegisterBlockClass(Mod?.Info?.ModID + ".cartography-table", typeof(BlockCartographyTable));
-        api.RegisterBlockClass(Mod?.Info?.ModID + ".advanced-cartography-table", typeof(BlockAdvancedCartographyTable));
-        api.RegisterBlockClass(Mod?.Info?.ModID + ".advanced-cartography-table-part", typeof(BlockAdvancedCartographyTablePart));
-        api.RegisterItemClass(Mod?.Info?.ModID + ".item-quill", typeof(ItemQuill));
-        Settings.Init(api, Mod?.Info?.ModID);
+        // The temporary ModDB fork has its own package ID, but deliberately
+        // retains the original asset domain so existing worlds and configs
+        // remain compatible when it replaces the official archive.
+        api.RegisterBlockEntityClass(CartographyTableConstants.MOD_ID + ".cartography-table-entity", typeof(BlockEntityCartographyTable));
+        api.RegisterBlockClass(CartographyTableConstants.MOD_ID + ".cartography-table", typeof(BlockCartographyTable));
+        api.RegisterBlockClass(CartographyTableConstants.MOD_ID + ".advanced-cartography-table", typeof(BlockAdvancedCartographyTable));
+        api.RegisterBlockClass(CartographyTableConstants.MOD_ID + ".advanced-cartography-table-part", typeof(BlockAdvancedCartographyTablePart));
+        api.RegisterItemClass(CartographyTableConstants.MOD_ID + ".item-quill", typeof(ItemQuill));
+        Settings.Init(api, CartographyTableConstants.MOD_ID);
         Settings.Load();
         if (!disableCommands)
         {
