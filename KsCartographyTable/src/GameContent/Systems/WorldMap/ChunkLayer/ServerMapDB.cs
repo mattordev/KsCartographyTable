@@ -421,8 +421,9 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 		}
 
         // One atomic packet write: pixels and the player's known-chunk mapping are
-        // committed together. Serialization happens before the write transaction so
-        // CPU work does not unnecessarily hold SQLite's write lock.
+        // committed together. A map piece is a 32x32 image and different players can
+        // have explored different pixels in the same piece, so replacing the whole
+        // row would erase the other player's explored pixels.
         public void StoreMapPieces(Dictionary<FastVec2i, MapPieceDB> pieces, string playerUid)
         {
             ArgumentNullException.ThrowIfNull(pieces);
@@ -430,12 +431,12 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
             if (pieces.Count == 0) return;
             using var timing = CartographyPerformanceTrace.Start(coreApi, "upload.store-worker");
             timing?.Detail($"pieces={pieces.Count}");
-            var serialized = new List<KeyValuePair<ulong, byte[]>>(pieces.Count);
+            var serialized = new List<(ulong Position, MapPieceDB Piece, byte[] Data)>(pieces.Count);
             long bytes = 0;
             foreach (var piece in pieces)
             {
                 var data = SerializerUtil.Serialize(piece.Value);
-                serialized.Add(new(piece.Key.ToChunkIndex(), data));
+                serialized.Add((piece.Key.ToChunkIndex(), piece.Value, data));
                 bytes += data.Length;
             }
             timing?.Mark("serialize");
@@ -443,20 +444,62 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
             using var transaction = sqliteConn.BeginTransaction();
             timing?.Mark("begin");
-            setUploadedMapPieceCmd.Transaction = transaction;
-            setPlayerExploredMapPieceCmd.Transaction = transaction;
-            setPlayerExploredMapPieceCmd.Parameters["@uid"].Value = playerUid;
-            foreach (var piece in serialized)
+            try
             {
-                setUploadedMapPieceCmd.Parameters["@pos"].Value = piece.Key;
-                setUploadedMapPieceCmd.Parameters["@data"].Value = piece.Value;
-                setUploadedMapPieceCmd.ExecuteNonQuery();
-                setPlayerExploredMapPieceCmd.Parameters["@pos"].Value = piece.Key;
-                setPlayerExploredMapPieceCmd.ExecuteNonQuery();
+                setUploadedMapPieceCmd.Transaction = transaction;
+                setPlayerExploredMapPieceCmd.Transaction = transaction;
+                getMapPieceWithPosCmd.Transaction = transaction;
+                setPlayerExploredMapPieceCmd.Parameters["@uid"].Value = playerUid;
+                foreach (var piece in serialized)
+                {
+                    byte[] data = piece.Data;
+                    getMapPieceWithPosCmd.Parameters["@pos"].Value = piece.Position;
+                    byte[] existingData = null;
+                    using (var reader = getMapPieceWithPosCmd.ExecuteReader())
+                    {
+                        if (reader.Read()) existingData = reader["data"] as byte[];
+                    }
+                    if (existingData != null)
+                    {
+                        var existing = SerializerUtil.Deserialize<MapPieceDB>(existingData);
+                        if (MergeExploredPixels(existing, piece.Piece))
+                            data = SerializerUtil.Serialize(piece.Piece);
+                    }
+                    setUploadedMapPieceCmd.Parameters["@pos"].Value = piece.Position;
+                    setUploadedMapPieceCmd.Parameters["@data"].Value = data;
+                    setUploadedMapPieceCmd.ExecuteNonQuery();
+                    setPlayerExploredMapPieceCmd.Parameters["@pos"].Value = piece.Position;
+                    setPlayerExploredMapPieceCmd.ExecuteNonQuery();
+                }
+                timing?.Mark("execute");
+                transaction.Commit();
+                timing?.Mark("commit");
             }
-            timing?.Mark("execute");
-            transaction.Commit();
-            timing?.Mark("commit");
+            finally
+            {
+                getMapPieceWithPosCmd.Transaction = null;
+                setUploadedMapPieceCmd.Transaction = null;
+                setPlayerExploredMapPieceCmd.Transaction = null;
+            }
+        }
+
+        private static bool MergeExploredPixels(MapPieceDB existing, MapPieceDB incoming)
+        {
+            if (existing?.Pixels == null || incoming?.Pixels == null ||
+                existing.Pixels.Length != incoming.Pixels.Length) return false;
+
+            bool changed = false;
+            for (int i = 0; i < incoming.Pixels.Length; i++)
+            {
+                // Vintage Story represents an unexplored map pixel as transparent
+                // zero. Keep the stored pixel when this player has not explored it.
+                if (incoming.Pixels[i] == 0 && existing.Pixels[i] != 0)
+                {
+                    incoming.Pixels[i] = existing.Pixels[i];
+                    changed = true;
+                }
+            }
+            return changed;
         }
 
 		public Dictionary<FastVec2i, MapPieceDB> GetNewMapPiecesForPlayer(IPlayer player)

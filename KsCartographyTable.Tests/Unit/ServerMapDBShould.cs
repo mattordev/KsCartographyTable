@@ -273,6 +273,26 @@ public class ServerMapDBShould
         Assert.That(database.GetNewMapPiecesForPlayer("alice"), Is.Empty);
     }
 
+    [Test]
+    public void MergeDifferentPlayersExploredPixelsWithinTheSameMapPiece()
+    {
+        Open();
+        var position = new FastVec2i(10, 20);
+        int red = unchecked((int)0xff0000ff);
+        int green = unchecked((int)0xff00ff00);
+        int blue = unchecked((int)0xffff0000);
+        int yellow = unchecked((int)0xff00ffff);
+
+        database.StoreMapPieces(new() { [position] = new() { Pixels = [red, 0, blue, 0] } }, "alice");
+        database.StoreMapPieces(new() { [position] = new() { Pixels = [0, green, yellow, 0] } }, "bob");
+
+        Assert.That(database.GetAllMapPieces()[position].Pixels,
+            Is.EqualTo(new[] { red, green, yellow, 0 }),
+            "Bob's unexplored pixels must not erase terrain Alice already uploaded.");
+        Assert.That(database.GetNewMapPiecesForPlayer("alice"), Is.Empty);
+        Assert.That(database.GetNewMapPiecesForPlayer("bob"), Is.Empty);
+    }
+
     private static CartographyWaypoint Waypoint(string guid, string owner, string parent = null)
     {
         return new CartographyWaypoint(new Waypoint

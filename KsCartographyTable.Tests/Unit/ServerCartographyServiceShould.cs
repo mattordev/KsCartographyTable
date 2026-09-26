@@ -142,6 +142,24 @@ public class ServerCartographyServiceShould
             Assert.That(downloads[1].Pieces, Is.Empty, "Cancellation while preparing must not start reading/sending terrain.");
             ackHandler.Invoke(service, [player, new MapTransferAck { SessionId=cancelledId, Sequence=0, Success=true }]);
             Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.False);
+
+            string aliceUpload = Guid.NewGuid().ToString();
+            handler.Invoke(service, [player, new MapSyncPacket(new()
+            {
+                [new(50, 20)] = new() { Pixels = Enumerable.Repeat(unchecked((int)0xff112233), 1024).ToArray() }
+            }, table.Block, table.Pos) { SessionId = aliceUpload, Sequence = 0 }]);
+            var bob = Substitute.For<IServerPlayer>();
+            bob.PlayerUID.Returns("bob");
+            bob.Entity.Returns(new EntityPlayer());
+            int acknowledgementsBeforeBob = acknowledgements.Count;
+            handler.Invoke(service, [bob, new MapSyncPacket(new()
+            {
+                [new(51, 20)] = new() { Pixels = Enumerable.Repeat(unchecked((int)0xff445566), 1024).ToArray() }
+            }, table.Block, table.Pos) { SessionId = Guid.NewGuid().ToString(), Sequence = 0 }]);
+            Assert.That(acknowledgements, Has.Count.EqualTo(acknowledgementsBeforeBob + 1));
+            Assert.That(acknowledgements[^1].Success, Is.False);
+            Assert.That(acknowledgements[^1].Error, Does.Contain("already in use"),
+                "A second player must not race an upload already active on this table.");
         }
         finally
         {

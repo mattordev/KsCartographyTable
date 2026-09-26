@@ -167,6 +167,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             {
                 if (packet.Sequence != 0 || uploads.Values.Any(s => s.Uid == player.PlayerUID))
                 { Ack(player, packet.SessionId, packet.Sequence, "A previous upload is still finishing."); return; }
+                if (uploads.Values.Any(s => s.Table == table) || downloads.Values.Any(s => s.Table == table))
+                { Ack(player, packet.SessionId, packet.Sequence, "This cartography table is already in use."); return; }
                 state = new() { Id = packet.SessionId, Uid = player.PlayerUID, Player = player, Table = table, BlockId = packet.BlockId };
                 uploads.Add(state.Id, state);
             }
@@ -314,6 +316,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             if (table == null) { Ack(player, request.SessionId, -1, "The cartography table is no longer available."); return; }
             if (downloads.Values.Any(s => s.Uid == player.PlayerUID))
             { Ack(player, request.SessionId, -1, "A previous download is still finishing."); return; }
+            if (uploads.Values.Any(s => s.Table == table) || downloads.Values.Any(s => s.Table == table))
+            { Ack(player, request.SessionId, -1, "This cartography table is already in use."); return; }
             var state = new Download { Id = request.SessionId, Uid = player.PlayerUID, Player = player, Table = table, BlockId = request.BlockId, Pending = true };
             downloads.Add(state.Id, state);
             var snapshot = request.IncludeWaypoints && Settings.WaypointDownload ? serverWaypointManager.Capture(player, table) : null;
