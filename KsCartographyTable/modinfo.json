@@ -1,13 +1,16 @@
 ﻿{
     "type": "code",
     "modid": "kscartographytable",
-    "name": "K's Cartography Table",
+    "name": "K's Cartography Table – Unofficial Performance Fix",
     "authors": [
         "Kaisentlaia"
     ],
-    "description": "Share your map with friends in a vanilla-friendly way!",
-    "networkVersion": "2.0.4",
-    "version": "2.0.4",
+    "contributors": [
+        "mattordev"
+    ],
+    "description": "Unofficial performance-fix build of K's Cartography Table. Replaces the official archive.",
+    "networkVersion": "2.0.6",
+    "version": "2.0.6",
     "side" : "Universal",
     "requiredOnClient": true,
     "requiredOnServer": true,
