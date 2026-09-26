@@ -19,6 +19,17 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
         public EnumAppSide Side;
         public CartographyMap Map;
         public CartographyTableFxController fxController;
+        private string storageId;
+        private const string StorageIdAttribute = "CartographyStorageId";
+
+        internal string StorageId
+        {
+            get
+            {
+                if (!Guid.TryParseExact(storageId, "N", out _)) storageId = Guid.NewGuid().ToString("N");
+                return storageId;
+            }
+        }
 
         public bool IsAdvanced
         {
@@ -116,6 +127,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
         {
             using var timing = CartographyPerformanceTrace.Start(Api, "blockentity.serialize");
             base.ToTreeAttributes(tree);
+            tree.SetString(StorageIdAttribute, StorageId);
             Map?.Serialize(tree);
             if (timing != null)
             {
@@ -137,6 +149,10 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
             using var timing = CartographyPerformanceTrace.Start(Api, "blockentity.deserialize");
             timing?.Detail($"pos={Pos} idsJsonChars={tree.GetString("ExploredAreasIds")?.Length ?? 0}");
             base.FromTreeAttributes(tree, worldForResolving);
+            string savedStorageId = tree.GetString(StorageIdAttribute);
+            storageId = Guid.TryParseExact(savedStorageId, "N", out Guid parsedStorageId)
+                ? parsedStorageId.ToString("N")
+                : null;
             EnsureMap();
             bool wasWiping = Map.IsWiping;
             bool wasWriting = Map.IsWriting;

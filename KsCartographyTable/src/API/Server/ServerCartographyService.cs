@@ -56,23 +56,67 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
         sealed class DatabaseSet(string root, ICoreServerAPI api, ILogger logger) : IDisposable
         {
             readonly Dictionary<string, ServerMapDB> connections = [];
-            internal ServerMapDB Get(string id)
+            internal ServerMapDB Get(string id, IReadOnlyCollection<string> legacyIds)
             {
                 if (connections.TryGetValue(id, out var existing)) return existing;
+                if (!Guid.TryParseExact(id, "N", out _)) throw new InvalidDataException("Invalid cartography table storage ID");
                 using var timing = CartographyPerformanceTrace.Start(api, "db.open-worker");
                 timing?.Detail($"table={id} cache=miss indexes=create-if-missing");
                 if (timing != null) timing.AlwaysLog = true;
                 Directory.CreateDirectory(root);
+                string path = Path.Combine(root, id + ".db");
+                MigrateLegacy(path, legacyIds);
                 var db = new ServerMapDB(api, logger);
                 string error = null;
                 try
                 {
-                    if (!db.OpenOrCreate(Path.Combine(root, id + ".db"), ref error, true, true, false))
+                    if (!db.OpenOrCreate(path, ref error, true, true, false))
                         throw new IOException(error ?? "Cannot open table database");
                     connections.Add(id, db);
                     return db;
                 }
                 catch { db.Dispose(); throw; }
+            }
+            void MigrateLegacy(string target, IReadOnlyCollection<string> legacyIds)
+            {
+                if (File.Exists(target) || legacyIds == null) return;
+                var candidates = legacyIds.Where(value => int.TryParse(value, out _))
+                    .Select(value => Path.Combine(root, value + ".db"))
+                    .Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(path => new FileInfo(path).Length).ToArray();
+                if (candidates.Length == 0) return;
+                File.Copy(candidates[0], target, false);
+                if (candidates.Length == 1) return;
+
+                using var targetDb = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={target};Pooling=False");
+                targetDb.Open();
+                for (int i = 1; i < candidates.Length; i++)
+                {
+                    using var attach = targetDb.CreateCommand();
+                    attach.CommandText = "ATTACH DATABASE @path AS legacy";
+                    attach.Parameters.AddWithValue("@path", candidates[i]);
+                    attach.ExecuteNonQuery();
+                    try
+                    {
+                        foreach (string sql in new[]
+                        {
+                            "INSERT OR IGNORE INTO mappiece SELECT * FROM legacy.mappiece",
+                            "INSERT OR IGNORE INTO playerchunkmapping SELECT * FROM legacy.playerchunkmapping",
+                            "INSERT OR IGNORE INTO sharedwaypoints SELECT * FROM legacy.sharedwaypoints"
+                        })
+                        {
+                            using var merge = targetDb.CreateCommand();
+                            merge.CommandText = sql;
+                            merge.ExecuteNonQuery();
+                        }
+                    }
+                    finally
+                    {
+                        using var detach = targetDb.CreateCommand();
+                        detach.CommandText = "DETACH DATABASE legacy";
+                        detach.ExecuteNonQuery();
+                    }
+                }
             }
             internal void Delete(string id)
             {
@@ -83,7 +127,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
         }
         sealed class Upload
         {
-            internal string Id, Uid, BlockId;
+            internal string Id, Uid, BlockId, StorageId;
+            internal string[] LegacyIds;
             internal BlockEntityCartographyTable Table;
             internal IServerPlayer Player;
             internal int Expected, Received;
@@ -93,7 +138,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
         }
         sealed class Download
         {
-            internal string Id, Uid, BlockId;
+            internal string Id, Uid, BlockId, StorageId;
+            internal string[] LegacyIds;
             internal BlockEntityCartographyTable Table;
             internal IServerPlayer Player;
             internal HashSet<ulong> Known;
@@ -135,15 +181,28 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
 
         BlockEntityCartographyTable Validate(IServerPlayer player, string id, BlockPos pos)
         {
-            if (disposed || pos == null || !int.TryParse(id, out _) || maintenance.Contains(id)) return null;
+            if (disposed || pos == null || !int.TryParse(id, out _)) return null;
             var table = CoreServerAPI.World.BlockAccessor.GetBlockEntity(pos) as BlockEntityCartographyTable;
-            if (table?.Block.Id.ToString() != id) return null;
+            if (table?.Block.Id.ToString() != id || maintenance.Contains(table.StorageId)) return null;
             var p = player.Entity.Pos;
             if (Math.Pow(p.X - pos.X, 2) + Math.Pow(p.Y - pos.Y, 2) + Math.Pow(p.Z - pos.Z, 2) > 100) return null;
             return table;
         }
         bool Live(BlockEntityCartographyTable table) => !disposed &&
             ReferenceEquals(CoreServerAPI.World.BlockAccessor.GetBlockEntity(table.Pos), table);
+        string[] LegacyIds(BlockEntityCartographyTable table)
+        {
+            var ids = new HashSet<string> { table.Block.Id.ToString() };
+            if (table.Block is BlockCartographyTable block && block.Code != null && block.Variant?.ContainsKey("state") == true)
+            {
+                foreach (string state in new[] { "empty", "filled" })
+                {
+                    var variant = CoreServerAPI.World.GetBlock(block.CodeWithVariant("state", state));
+                    if (variant != null) ids.Add(variant.Id.ToString());
+                }
+            }
+            return [.. ids];
+        }
         void Ack(IServerPlayer player, string id, int seq, string error = null)
         {
             if (disposed) return;
@@ -169,7 +228,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
                 { Ack(player, packet.SessionId, packet.Sequence, "A previous upload is still finishing."); return; }
                 if (uploads.Values.Any(s => s.Table == table) || downloads.Values.Any(s => s.Table == table))
                 { Ack(player, packet.SessionId, packet.Sequence, "This cartography table is already in use."); return; }
-                state = new() { Id = packet.SessionId, Uid = player.PlayerUID, Player = player, Table = table, BlockId = packet.BlockId };
+                state = new() { Id = packet.SessionId, Uid = player.PlayerUID, Player = player, Table = table, BlockId = packet.BlockId,
+                    StorageId = table.StorageId, LegacyIds = LegacyIds(table) };
                 uploads.Add(state.Id, state);
             }
             if (state.Uid != player.PlayerUID || state.Table != table || state.Pending || packet.Sequence != state.Expected) return;
@@ -190,7 +250,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             bool advanced = table.IsAdvanced;
             int batchPieces = batch.Sum(item => item.Pieces.Count);
             int received = state.Received + (advanced ? batchPieces : 0);
-            string uid = state.Uid, blockId = state.BlockId;
+            string uid = state.Uid, storageId = state.StorageId;
+            string[] legacyIds = state.LegacyIds;
             double queued = Now;
             state.Pending = true;
             bool accepted = worker.TryEnqueue(dbSet =>
@@ -198,7 +259,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
                 using var timing = CartographyPerformanceTrace.Start(CoreServerAPI, "upload.worker");
                 timing?.Detail($"session={packet.SessionId} seq={batch[0].Sequence}-{packet.Sequence} packets={batch.Length} pieces={batchPieces} queueMs={(Now - queued) * 1000:F1} final={packet.IsFinalBatch}");
                 if (timing != null) timing.AlwaysLog = packet.Sequence == 0 || packet.IsFinalBatch;
-                var db = dbSet.Get(blockId); timing?.Mark("open");
+                var db = dbSet.Get(storageId, legacyIds); timing?.Mark("open");
                 if (advanced && batchPieces > 0)
                 {
                     var combined = new Dictionary<FastVec2i, MapPieceDB>(batchPieces);
@@ -318,7 +379,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             { Ack(player, request.SessionId, -1, "A previous download is still finishing."); return; }
             if (uploads.Values.Any(s => s.Table == table) || downloads.Values.Any(s => s.Table == table))
             { Ack(player, request.SessionId, -1, "This cartography table is already in use."); return; }
-            var state = new Download { Id = request.SessionId, Uid = player.PlayerUID, Player = player, Table = table, BlockId = request.BlockId, Pending = true };
+            var state = new Download { Id = request.SessionId, Uid = player.PlayerUID, Player = player, Table = table, BlockId = request.BlockId,
+                StorageId = table.StorageId, LegacyIds = LegacyIds(table), Pending = true };
             downloads.Add(state.Id, state);
             var snapshot = request.IncludeWaypoints && Settings.WaypointDownload ? serverWaypointManager.Capture(player, table) : null;
             table.SetWriting(true);
@@ -327,7 +389,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
                 using var timing = CartographyPerformanceTrace.Start(CoreServerAPI, "download.prepare-worker");
                 if (timing != null) timing.AlwaysLog = true;
                 var known = new HashSet<ulong>(request.KnownIds);
-                var plan = snapshot == null ? null : serverWaypointManager.ReadPlayerWaypoints(snapshot, dbSet.Get(request.BlockId));
+                var plan = snapshot == null ? null : serverWaypointManager.ReadPlayerWaypoints(snapshot, dbSet.Get(state.StorageId, state.LegacyIds));
                 timing?.Detail($"session={request.SessionId} actualClientIds={known.Count} historicalMapping=ignored");
                 return (known, plan);
             }, result =>
@@ -350,13 +412,13 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             if (!state.Stop && Now - state.LastSend < Math.Max(0.05, Settings.PacketDelay)) return;
             if (state.Stop || !state.Table.IsAdvanced) { SendDownload(state, new([], state.Cursor, true)); return; }
             state.Pending = true;
-            string id = state.BlockId; var known = state.Known; var cursor = state.Cursor;
+            string id = state.StorageId; string[] legacyIds = state.LegacyIds; var known = state.Known; var cursor = state.Cursor;
             int batchSize = Math.Clamp(Settings.ChunksPerPacket, 1, TransferProtocol.MaximumPieces);
             double queued = Now;
             if (!worker.TryEnqueue(dbSet =>
             {
                 using var timing = CartographyPerformanceTrace.Start(CoreServerAPI, "download.read-worker");
-                var batch = dbSet.Get(id).ReadMapBatch(known, cursor, batchSize, TransferProtocol.MaximumMapDataBytes);
+                var batch = dbSet.Get(id, legacyIds).ReadMapBatch(known, cursor, batchSize, TransferProtocol.MaximumMapDataBytes);
                 timing?.Detail($"session={state.Id} pieces={batch.Pieces.Count} final={batch.Complete} queueMs={(Now - queued) * 1000:F1}");
                 if (timing != null) timing.AlwaysLog = cursor == null || batch.Complete;
                 return batch;
@@ -413,10 +475,11 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
         }
         public void WipeTableMap(Block block, IPlayer player, BlockEntityCartographyTable table)
         {
-            string id = block.Id.ToString();
+            string id = table.StorageId;
+            string[] legacyIds = LegacyIds(table);
             if (!maintenance.Add(id)) return;
             StopTable(id);
-            if (!worker.TryEnqueue(dbs => { dbs.Get(id).Wipe(); return true; }, _ =>
+            if (!worker.TryEnqueue(dbs => { dbs.Get(id, legacyIds).Wipe(); return true; }, _ =>
             {
                 maintenance.Remove(id);
                 if (!Live(table)) return;
@@ -426,16 +489,16 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             { maintenance.Remove(id); table.SetWiping(false); }
         }
         // A removed table uses the same worker fence as writes, avoiding close/use races.
-        public void CleanupMapData(Block block)
+        public void CleanupMapData(BlockEntityCartographyTable table)
         {
-            string id = block.Id.ToString(); StopTable(id); maintenance.Add(id);
+            string id = table.StorageId; StopTable(id); maintenance.Add(id);
             if (!worker.TryEnqueue(dbs => { dbs.Delete(id); return true; }, _ => maintenance.Remove(id), error =>
                 { maintenance.Remove(id); CoreServerAPI.Logger.Error("[kscartographytable] Cleanup failed: {0}", error); })) maintenance.Remove(id);
         }
         void StopTable(string id)
         {
-            foreach (var s in uploads.Values.Where(s => s.BlockId == id).ToArray()) FailUpload(s, s.Expected, new IOException("Table is being cleared"));
-            foreach (var s in downloads.Values.Where(s => s.BlockId == id).ToArray()) FailDownload(s, new IOException("Table is being cleared"));
+            foreach (var s in uploads.Values.Where(s => s.StorageId == id).ToArray()) FailUpload(s, s.Expected, new IOException("Table is being cleared"));
+            foreach (var s in downloads.Values.Where(s => s.StorageId == id).ToArray()) FailDownload(s, new IOException("Table is being cleared"));
         }
         public void MarkWaypointDeleted(IServerPlayer player, int index)
         {

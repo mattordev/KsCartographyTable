@@ -444,7 +444,8 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
             if (shouldCleanup)
             {
-                KsCartographyTableModSystem.ServerCartographyService?.CleanupMapData(this);
+                var table = world.BlockAccessor.GetBlockEntity(pos) as BlockEntityCartographyTable;
+                if (table != null) KsCartographyTableModSystem.ServerCartographyService?.CleanupMapData(table);
             }
 
             base.OnBlockBroken(world, pos, byPlayer, dropQuantityMultiplier);

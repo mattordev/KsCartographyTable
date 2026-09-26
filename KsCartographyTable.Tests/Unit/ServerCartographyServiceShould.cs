@@ -64,9 +64,21 @@ public class ServerCartographyServiceShould
             Block = new BlockAdvancedCartographyTable { BlockId = 123 }, Map = new CartographyMap(api)
         };
         world.BlockAccessor.GetBlockEntity(table.Pos).Returns(table);
+        string legacyDirectory = Path.Combine(root, CartographyTableConstants.MOD_ID);
+        Directory.CreateDirectory(legacyDirectory);
+        string legacyError = null;
+        using (var legacy = new ServerMapDB(api, logger))
+        {
+            Assert.That(legacy.OpenOrCreate(Path.Combine(legacyDirectory, "123.db"), ref legacyError, true, true, false),
+                Is.True, legacyError);
+            legacy.StoreMapPieces(new()
+            {
+                [new(99, 20)] = new() { Pixels = Enumerable.Repeat(unchecked((int)0xff778899), 1024).ToArray() }
+            }, "legacy-player");
+        }
         var service = new ServerCartographyService(api);
         string id = Guid.NewGuid().ToString();
-        string path = Path.Combine(root, CartographyTableConstants.MOD_ID, "123.db");
+        string path = Path.Combine(root, CartographyTableConstants.MOD_ID, table.StorageId + ".db");
         var handler = typeof(ServerCartographyService).GetMethod("OnMapUploadRequest", BindingFlags.Instance | BindingFlags.NonPublic)!;
         void Receive(int sequence, int x, bool final = false) => handler.Invoke(service, [player,
             new MapSyncPacket(final ? [] : new() { [new(x, 20)] = new() { Pixels = Enumerable.Repeat(x, 1024).ToArray() } },
@@ -108,13 +120,14 @@ public class ServerCartographyServiceShould
             Receive(committedPackets, 0, final: true);
             await PumpUntil(() => acknowledgements.Count == committedPackets + 1);
             Assert.That(acknowledgements[^1].Success, Is.True, acknowledgements[^1].Error);
-            Assert.That(table.Map.ExploredAreasIds, Has.Count.EqualTo(committedPackets),
-                "Final table metadata must include every committed packet.");
+            int totalStoredPieces = committedPackets + 1;
+            Assert.That(table.Map.ExploredAreasIds, Has.Count.EqualTo(totalStoredPieces),
+                "Final table metadata must include migrated and newly committed packets.");
             using var reader = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
             reader.Open();
             using var command = reader.CreateCommand();
             command.CommandText = "SELECT COUNT(*) FROM mappiece";
-            Assert.That(Convert.ToInt32(command.ExecuteScalar()), Is.EqualTo(committedPackets));
+            Assert.That(Convert.ToInt32(command.ExecuteScalar()), Is.EqualTo(totalStoredPieces));
 
             // The same uploader returns with no local IDs. Exercise the real
             // request handler, not just the SQL query used by the new handshake.
@@ -124,7 +137,7 @@ public class ServerCartographyServiceShould
             requestHandler.Invoke(service, [player, new MapDownloadRequest
             { SessionId=downloadId, BlockId="123", Position=table.Pos, KnownIds=[], IncludeWaypoints=false }]);
             await PumpUntil(() => downloads.Count == 1);
-            Assert.That(downloads[0].Pieces, Has.Count.EqualTo(committedPackets));
+            Assert.That(downloads[0].Pieces, Has.Count.EqualTo(totalStoredPieces));
             Assert.That(downloads[0].IsFinalBatch, Is.True);
             Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.True,
                 "Sending the final batch must not finish before client persistence.");
