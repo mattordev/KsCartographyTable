@@ -7,7 +7,10 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
     internal static class TransferProtocol
     {
         internal const string Channel = "kscartographytable-transfer-v3";
-        internal const int MaximumPieces = 256;
+        internal const int MaximumPieces = 512;
+        // ChunksPerPacket remains the requested count. This separate byte budget
+        // prevents variable-sized map pieces from creating an unsafe wire packet.
+        internal const int MaximumMapDataBytes = 512 * 1024;
         internal const int MaximumIds = 2_000_000;
         internal const double TimeoutSeconds = 120;
     }

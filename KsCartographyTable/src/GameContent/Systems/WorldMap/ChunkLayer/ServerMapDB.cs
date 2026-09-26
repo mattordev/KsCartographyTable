@@ -338,12 +338,15 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
         /// Scan only the compact position index and fetch pixels for missing chunks.
         /// The cursor advances over excluded rows too, avoiding repeated prefix scans.
         /// </summary>
-        public MapReadBatch ReadMapBatch(HashSet<ulong> excludedIds, long? afterPosition, int maximumPieces = 25)
+        public MapReadBatch ReadMapBatch(HashSet<ulong> excludedIds, long? afterPosition,
+            int maximumPieces = 25, int maximumBatchBytes = TransferProtocol.MaximumMapDataBytes)
         {
             ArgumentNullException.ThrowIfNull(excludedIds);
-            if (maximumPieces < 1 || maximumPieces > 256) throw new ArgumentOutOfRangeException(nameof(maximumPieces));
+            if (maximumPieces < 1 || maximumPieces > TransferProtocol.MaximumPieces) throw new ArgumentOutOfRangeException(nameof(maximumPieces));
+            ArgumentOutOfRangeException.ThrowIfLessThan(maximumBatchBytes, 1);
             const int pageSize = 256;
             var pieces = new Dictionary<FastVec2i, MapPieceDB>();
+            long batchBytes = 0;
             long? cursor = afterPosition;
             using var positionsCommand = sqliteConn.CreateCommand();
             while (true)
@@ -361,17 +364,24 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 }
                 for (int index = 0; index < positions.Count; index++)
                 {
-                    cursor = positions[index];
-                    ulong id = unchecked((ulong)cursor.Value);
-                    if (excludedIds.Contains(id)) continue;
-                    getMapPieceWithPosCmd.Parameters["@pos"].Value = cursor.Value;
+                    long position = positions[index];
+                    ulong id = unchecked((ulong)position);
+                    if (excludedIds.Contains(id)) { cursor = position; continue; }
+                    getMapPieceWithPosCmd.Parameters["@pos"].Value = position;
                     using (var reader = getMapPieceWithPosCmd.ExecuteReader())
                     {
                         if (reader.Read() && reader["data"] is byte[] bytes)
                         {
+                            // Leave this position for the next call when adding it
+                            // would exceed the byte budget. One oversized piece is
+                            // allowed so forward progress is always possible.
+                            if (pieces.Count > 0 && batchBytes + bytes.Length > maximumBatchBytes)
+                                return new MapReadBatch(pieces, cursor, false);
                             pieces.Add(ChunkIdToFastVect2i(id), SerializerUtil.Deserialize<MapPieceDB>(bytes));
+                            batchBytes += bytes.Length;
                         }
                     }
+                    cursor = position;
                     if (pieces.Count == maximumPieces)
                     {
                         return new MapReadBatch(pieces, cursor, index == positions.Count - 1 && positions.Count < pageSize);

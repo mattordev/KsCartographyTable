@@ -150,6 +150,26 @@ public class SqliteMapUploadSourceShould
     }
 
     [Test]
+    public async Task SplitConfiguredChunkCountAtTheSerializedByteBudget()
+    {
+        byte[][] blobs = Enumerable.Range(0, 3)
+            .Select(i => Pixels(i))
+            .ToArray();
+        for (int i = 0; i < blobs.Length; i++) Insert(new FastVec2i(i, 10), blobs[i]);
+        int byteBudget = blobs.Max(blob => blob.Length) + 1;
+
+        var source = Start([], batchSize: 150, maximumBatchBytes: byteBudget);
+        var batches = await Drain(source);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(source.Error, Is.Null);
+            Assert.That(batches.Select(batch => batch.Count), Is.EqualTo(new[] { 1, 1, 1 }));
+            Assert.That(batches.Sum(batch => batch.Count), Is.EqualTo(3));
+        }
+    }
+
+    [Test]
     public async Task ReportReadFailuresSeparatelyFromAnEmptySuccessfulUpload()
     {
         string missingPath = Path.Combine(directory, "missing.db");
@@ -210,9 +230,10 @@ public class SqliteMapUploadSourceShould
         }
     }
 
-    private SqliteMapUploadSource Start(IEnumerable<ulong> known, int batchSize, int queueCapacity = 2, int pageSize = 256)
+    private SqliteMapUploadSource Start(IEnumerable<ulong> known, int batchSize, int queueCapacity = 2,
+        int pageSize = 256, int maximumBatchBytes = TransferProtocol.MaximumMapDataBytes)
     {
-        var source = new SqliteMapUploadSource(databasePath, known, batchSize, queueCapacity, pageSize);
+        var source = new SqliteMapUploadSource(databasePath, known, batchSize, queueCapacity, pageSize, maximumBatchBytes);
         sources.Add(source);
         return source;
     }

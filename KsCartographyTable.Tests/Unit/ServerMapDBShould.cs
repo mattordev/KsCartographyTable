@@ -9,6 +9,7 @@ using Microsoft.Data.Sqlite;
 using NSubstitute;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
+using Vintagestory.API.Util;
 using Vintagestory.GameContent;
 
 namespace KsCartographyTable.test.Unit;
@@ -230,6 +231,32 @@ public class ServerMapDBShould
         Assert.That(complete, Is.True);
         Assert.That(found.Keys, Is.EquivalentTo(pieces.Keys.Where(k => !known.Contains(k.ToChunkIndex()))));
         foreach (var p in found) Assert.That(p.Value.Pixels, Is.EqualTo(new[] { p.Key.X }));
+    }
+
+    [Test]
+    public void SplitDownloadsAtTheSerializedByteBudgetWithoutSkippingTheDeferredPiece()
+    {
+        Open();
+        var pieces = Enumerable.Range(0, 3).ToDictionary(
+            i => new FastVec2i(i, 10),
+            i => new MapPieceDB { Pixels = Enumerable.Range(0, 128).Select(x => x + i).ToArray() });
+        database.StoreMapPieces(pieces, "alice");
+        int byteBudget = pieces.Values.Max(piece => SerializerUtil.Serialize(piece).Length) + 1;
+        var found = new Dictionary<FastVec2i, MapPieceDB>();
+        long? cursor = null;
+        bool complete = false;
+
+        for (int batches = 0; batches < 10 && !complete; batches++)
+        {
+            var batch = database.ReadMapBatch([], cursor, maximumPieces: 150, maximumBatchBytes: byteBudget);
+            Assert.That(batch.Pieces, Has.Count.EqualTo(1));
+            foreach (var piece in batch.Pieces) found.Add(piece.Key, piece.Value);
+            cursor = batch.LastPosition;
+            complete = batch.Complete;
+        }
+
+        Assert.That(complete, Is.True);
+        Assert.That(found.Keys, Is.EquivalentTo(pieces.Keys));
     }
 
     [Test]

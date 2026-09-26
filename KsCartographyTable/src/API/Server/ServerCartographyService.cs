@@ -336,7 +336,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             if (!worker.TryEnqueue(dbSet =>
             {
                 using var timing = CartographyPerformanceTrace.Start(CoreServerAPI, "download.read-worker");
-                var batch = dbSet.Get(id).ReadMapBatch(known, cursor, batchSize);
+                var batch = dbSet.Get(id).ReadMapBatch(known, cursor, batchSize, TransferProtocol.MaximumMapDataBytes);
                 timing?.Detail($"session={state.Id} pieces={batch.Pieces.Count} final={batch.Complete} queueMs={(Now - queued) * 1000:F1}");
                 if (timing != null) timing.AlwaysLog = cursor == null || batch.Complete;
                 return batch;

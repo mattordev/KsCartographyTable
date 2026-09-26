@@ -60,11 +60,13 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
             Milliseconds(Interlocked.Read(ref deserializeTicks)), Milliseconds(Interlocked.Read(ref queueWaitTicks)));
 
         internal SqliteMapUploadSource(string databasePath, IEnumerable<ulong> tableIds,
-            int batchSize, int queueCapacity = 2, int pageSize = 256)
+            int batchSize, int queueCapacity = 2, int pageSize = 256,
+            int maximumBatchBytes = TransferProtocol.MaximumMapDataBytes)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(batchSize, 1);
             ArgumentOutOfRangeException.ThrowIfLessThan(queueCapacity, 1);
             ArgumentOutOfRangeException.ThrowIfLessThan(pageSize, 1);
+            ArgumentOutOfRangeException.ThrowIfLessThan(maximumBatchBytes, 1);
             var knownIds = new HashSet<ulong>(tableIds);
             batches = Channel.CreateBounded<Dictionary<FastVec2i, MapPieceDB>>(new BoundedChannelOptions(queueCapacity)
             {
@@ -74,7 +76,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 SingleReader = false,
                 AllowSynchronousContinuations = false
             });
-            Completion = Task.Run(() => Produce(databasePath, knownIds, batchSize, pageSize));
+            Completion = Task.Run(() => Produce(databasePath, knownIds, batchSize, pageSize, maximumBatchBytes));
         }
 
         public bool TryTakeBatch(out Dictionary<FastVec2i, MapPieceDB> batch)
@@ -87,7 +89,8 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
         internal ValueTask<bool> WaitToReadBatchAsync(CancellationToken token) => batches.Reader.WaitToReadAsync(token);
 
-        private async Task Produce(string databasePath, HashSet<ulong> knownIds, int batchSize, int pageSize)
+        private async Task Produce(string databasePath, HashSet<ulong> knownIds, int batchSize,
+            int pageSize, int maximumBatchBytes)
         {
             CancellationToken token = cancellation.Token;
             try
@@ -118,6 +121,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 long lastPosition = long.MinValue;
                 var positions = new List<long>(pageSize);
                 var batch = new Dictionary<FastVec2i, MapPieceDB>(batchSize);
+                long batchBytes = 0;
                 while (true)
                 {
                     token.ThrowIfCancellationRequested();
@@ -151,15 +155,23 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                         if (bytes == null) continue;
                         Interlocked.Add(ref readBytes, bytes.Length);
                         token.ThrowIfCancellationRequested();
+                        if (batch.Count > 0 && batchBytes + bytes.Length > maximumBatchBytes)
+                        {
+                            await Enqueue(batch, token).ConfigureAwait(false);
+                            batch = new Dictionary<FastVec2i, MapPieceDB>(batchSize);
+                            batchBytes = 0;
+                        }
                         started = Stopwatch.GetTimestamp();
                         var piece = SerializerUtil.Deserialize<MapPieceDB>(bytes);
                         Interlocked.Add(ref deserializeTicks, Stopwatch.GetTimestamp() - started);
                         batch.Add(DecodeChunkId(chunkId), piece);
+                        batchBytes += bytes.Length;
                         Interlocked.Increment(ref preparedPieces);
                         if (batch.Count == batchSize)
                         {
                             await Enqueue(batch, token).ConfigureAwait(false);
                             batch = new Dictionary<FastVec2i, MapPieceDB>(batchSize);
+                            batchBytes = 0;
                         }
                     }
                 }
