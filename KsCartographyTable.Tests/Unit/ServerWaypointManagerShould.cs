@@ -11,11 +11,14 @@ namespace KsCartographyTable.test.Unit;
 
 [TestFixture("test valid playeruid", "RbeoiIPDZi9wTxVqQNIHVEVe", true, true)]
 [TestFixture("test invalid playeruid", "invalid characters in guid<>:\"/\\|?*", false, true)]
-[TestFixture("test invalid base64 playeruid", "ab?oiIPDZi9wTxVqQNIHVEVe", false, false)]
+// This UID is a valid Windows filename, but its legacy Base64 encoding contains '/'.
+[TestFixture("test invalid base64 playeruid", "a\u00bfoiIPDZi9wTxVqQNIHVEVe", true, false)]
+[NonParallelizable]
 public class ServerWaypointManagerShould
 {
     private ServerWaypointManager serverWaypointManager;
-    private readonly FakeCoreServerApi fakeCoreServerApi;
+    private FakeCoreServerApi fakeCoreServerApi;
+    private string testDataPath;
 
     private readonly FakePlayer player;
     private readonly Waypoint waypoint;
@@ -44,7 +47,18 @@ public class ServerWaypointManagerShould
     [SetUp]
     public void Setup()
     {
-        serverWaypointManager = new ServerWaypointManager(fakeCoreServerApi);
+        testDataPath = Directory.CreateTempSubdirectory("KsCartographyTable.Tests-").FullName;
+        string originalDataPath = GamePaths.DataPath;
+        try
+        {
+            // The constructor creates its data directory immediately, so redirect before calling it.
+            GamePaths.DataPath = testDataPath;
+            serverWaypointManager = new ServerWaypointManager(fakeCoreServerApi);
+        }
+        finally
+        {
+            GamePaths.DataPath = originalDataPath;
+        }
     }
 
     [Test]
@@ -175,11 +189,13 @@ public class ServerWaypointManagerShould
     [TearDown]
     public void CleanUp()
     {
-        string path =  Path.Combine(
-            GamePaths.DataPath,
-            "ModData",
-            fakeCoreServerApi.World.SavegameIdentifier
-        );
-        Directory.Delete(path, true);
+        if (testDataPath == null || !Directory.Exists(testDataPath)) return;
+
+        string resolvedPath = Path.GetFullPath(testDataPath);
+        string temporaryRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath()));
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        Assert.That(string.Equals(Path.GetDirectoryName(resolvedPath), temporaryRoot, comparison), Is.True,
+            "Only the temporary directory created for this test may be deleted.");
+        Directory.Delete(resolvedPath, true);
     }
 }

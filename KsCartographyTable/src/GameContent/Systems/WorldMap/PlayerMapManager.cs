@@ -14,6 +14,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 	{
         WorldMapManager WorldMapManager;
 		public ICoreClientAPI CoreClientAPI;
+        private readonly List<IMapUploadSource> uploads = [];
         ChunkMapLayer chunkMapLayer;
         public ChunkMapLayer ChunkMapLayer
         {
@@ -30,78 +31,38 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 return chunkMapLayer;
             }
         }
-		MapDB playerMapDb;
-		public MapDB PlayerMapDb
-		{
-			get
-			{
-				if (playerMapDb == null)
-				{
-                    var mapDbField = typeof(ChunkMapLayer).GetField("mapdb", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    playerMapDb = mapDbField?.GetValue(ChunkMapLayer) as MapDB;
-				}
-
-				return playerMapDb;
-			}
-		}
-		ServerMapDB playerMapDbReader;
-		public ServerMapDB PlayerMapDbReader
-		{
-			get
-			{
-				if (playerMapDbReader == null)
-				{
-                    string mapPath = Path.Combine(GamePaths.DataPath, "Maps", CoreClientAPI.World.SavegameIdentifier + ".db");
-                    playerMapDbReader = new ServerMapDB(CoreClientAPI);
-                    string error = null;
-                    playerMapDbReader.OpenOrCreate(mapPath, ref error, false, true, false);
-				}
-
-				return playerMapDbReader;
-			}
-		}
 		public PlayerMapManager(ICoreClientAPI api) {
 			CoreClientAPI = api;
             WorldMapManager = CoreClientAPI.ModLoader.GetModSystem<WorldMapManager>();
 		}
 
-        public Dictionary<FastVec2i, MapPieceDB> GetNewMapPieces(BlockEntityCartographyTable blockEntity)
+        internal IMapUploadSource StartUpload(BlockEntityCartographyTable blockEntity, int batchSize)
         {
-            if (!blockEntity.IsAdvanced)
+            for (int i = uploads.Count - 1; i >= 0; i--)
             {
-                return [];
-            }
-            List<FastVec2i> playerMapPiecesIds = PlayerMapDbReader.GetAllMapPiecesIds();
-            HashSet<ulong> tableMapPiecesIds = [.. blockEntity.Map.ExploredAreasIds];
-            Dictionary<FastVec2i, MapPieceDB> pieces = [];
-            if (tableMapPiecesIds.Count == 0)
-            {
-                pieces = PlayerMapDbReader.GetAllMapPieces();
-                KsCartographyTableModSystem.DebugLog(CoreClientAPI, $"no pieces ids on map, uploading all player's map pieces {pieces.Count}");
-            }
-            else
-            {
-                List<FastVec2i> filteredMapPiecesPositions = tableMapPiecesIds.Count > 0 ? [.. playerMapPiecesIds.Where(id => !tableMapPiecesIds.Contains(id.ToChunkIndex()))] : playerMapPiecesIds;
-                pieces = PlayerMapDbReader.GetMapPiecesFromPositions(filteredMapPiecesPositions);
-                KsCartographyTableModSystem.DebugLog(CoreClientAPI, $"uploading filtered player's map pieces not present on map {pieces.Count}");
+                if (uploads[i].IsCompleted || uploads[i].IsCanceled)
+                {
+                    uploads[i].Dispose();
+                    uploads.RemoveAt(i);
+                }
             }
 
-            playerMapDbReader?.Dispose();
-            playerMapDbReader = null;
-
-            return pieces;
-        }
-
-        internal void UpdateMap(MapSyncPacket packet)
-        {
-            PlayerMapDb.SetMapPieces(packet.Pieces);
+            // Capture everything belonging to the game here. The source copies
+            // the IDs before starting its worker and never touches this entity.
+            string mapPath = blockEntity.IsAdvanced
+                ? Path.Combine(GamePaths.DataPath, "Maps", CoreClientAPI.World.SavegameIdentifier + ".db")
+                : null;
+            var source = new SqliteMapUploadSource(mapPath,
+                blockEntity.Map?.ExploredAreasIds ?? [], batchSize);
+            uploads.Add(source);
+            return source;
         }
 
         public void Dispose()
         {
-            KsCartographyTableModSystem.DebugLog(CoreClientAPI, $"disposing playerMapDbReader {playerMapDbReader}");
-            playerMapDb?.Dispose();
-            playerMapDb = null;
+            foreach (var upload in uploads) upload.Dispose();
+            uploads.Clear();
+            // The vanilla map layer owns its connection; never close it here.
         }
     }
 }

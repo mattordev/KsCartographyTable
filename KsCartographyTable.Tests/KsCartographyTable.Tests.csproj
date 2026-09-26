@@ -45,15 +45,26 @@
             <HintPath>$(VINTAGE_STORY)\Lib\Microsoft.Data.Sqlite.dll</HintPath>
             <Private>true</Private>
         </Reference>
+        <Reference Include="SQLitePCLRaw.batteries_v2">
+            <HintPath>$(VINTAGE_STORY)\Lib\SQLitePCLRaw.batteries_v2.dll</HintPath>
+            <Private>true</Private>
+        </Reference>
+        <Reference Include="SQLitePCLRaw.provider.e_sqlite3">
+            <HintPath>$(VINTAGE_STORY)\Lib\SQLitePCLRaw.provider.e_sqlite3.dll</HintPath>
+            <Private>true</Private>
+        </Reference>
     </ItemGroup>
 
     <ItemGroup>
+        <None Include="$(VINTAGE_STORY)\Lib\e_sqlite3.dll" Link="e_sqlite3.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(VINTAGE_STORY)\Lib\e_sqlite3.dll')" />
+        <None Include="$(VINTAGE_STORY)\Lib\libe_sqlite3.so" Link="libe_sqlite3.so" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(VINTAGE_STORY)\Lib\libe_sqlite3.so')" />
+        <None Include="$(VINTAGE_STORY)\Lib\libe_sqlite3.dylib" Link="libe_sqlite3.dylib" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(VINTAGE_STORY)\Lib\libe_sqlite3.dylib')" />
         <Using Include="NUnit.Framework" />
     </ItemGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\KsCartographyTable\KsCartographyTable.csproj" />
-        <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.10" />
+        <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.11" />
     </ItemGroup>
 
 </Project>

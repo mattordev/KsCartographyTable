@@ -1,134 +1,152 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading.Tasks;
 using Kaisentlaia.KsCartographyTableMod.API.Common;
 using Kaisentlaia.KsCartographyTableMod.API.Server;
 using Kaisentlaia.KsCartographyTableMod.GameContent;
+using Microsoft.Data.Sqlite;
 using NSubstitute;
-using Vintagestory.API.Config;
+using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
 namespace KsCartographyTable.test.Unit;
 
-[TestFixture("map upload")]
-public class ServerCartographyServiceShould(string savegameIdentifier)
+[NonParallelizable]
+public class ServerCartographyServiceShould
 {
-    private ServerCartographyService serverCartographyService;
-    private FakeCoreServerApi fakeCoreServerApi;
-    private FakeBlockAccessor fakeBlockAccessor;
-    private FakePlayer fakePlayer1;
-    private FakePlayer fakePlayer2;
-    private BlockAdvancedCartographyTable fakeTable;
-    private BlockEntityCartographyTable fakeBlockEntity;
-
-    private List<MapSyncPacket> packets = [];
-
-    private readonly List<ulong> chunkIds = [
-        2137551552120,
-        2137551552121,
-        2137551552122,
-        2137551552123,
-        2137551552124,
-        2137551552125,
-        2137551552126,
-        2137551552127,
-        2137551552128,
-        2137551552129
-    ];
-
-    [SetUp]
-    public void Setup()
-    {
-        // magic: without this any attempt to use Lang will fail with a System.IO.DirectoryNotFoundException
-        string vsPath = Environment.GetEnvironmentVariable("VINTAGE_STORY");
-        PropertyInfo assetsPathProp = typeof(GamePaths).GetProperty("AssetsPath");
-        assetsPathProp.GetSetMethod(true).Invoke(null, [Path.Combine(vsPath, "assets")]);
-
-        fakePlayer1 = new FakePlayer(Guid.NewGuid().ToString());
-        fakePlayer2 = new FakePlayer(Guid.NewGuid().ToString());
-        fakeTable = Substitute.For<BlockAdvancedCartographyTable>();
-        fakeBlockEntity = Substitute.For<BlockEntityCartographyTable>();
-        fakeBlockEntity.Pos = new BlockPos(0, 0, 128);
-        fakeBlockEntity.Block = fakeTable;
-        fakeBlockAccessor = new FakeBlockAccessor(fakeBlockEntity);
-        fakeCoreServerApi = new FakeCoreServerApi(savegameIdentifier, fakeBlockAccessor);
-        fakeBlockEntity.Api = fakeCoreServerApi;
-        Dictionary<FastVec2i, MapPieceDB> fakeMapPieces = [];
-        Random r = new();
-        
-        chunkIds
-            .Select((chunkId, index) => new { chunkId, index })
-            .ToList()
-            .ForEach(chunk => {            
-                fakeMapPieces.Add(
-                    ServerMapDB.ChunkIdToFastVect2i(chunk.chunkId),
-                    new MapPieceDB { Pixels = [r.Next(0, 100), r.Next(0, 100), r.Next(0, 100), r.Next(0, 100), r.Next(0, 100)] }
-                );
-                if (chunk.index % 3 == 0 || chunk.index > 8)
-                {
-                    packets.Add(new(fakeMapPieces, fakeTable, fakeBlockEntity.Pos, chunk.index > 8, null, false));
-                    fakeMapPieces = [];
-                }
-            });
-
-        serverCartographyService = new ServerCartographyService(fakeCoreServerApi);
-        KsCartographyTableModSystem ksCartographyTableModSystem = new(true, true);
-        ksCartographyTableModSystem.Start(fakeCoreServerApi);
-        ksCartographyTableModSystem.StartServerSide(fakeCoreServerApi);
-        Settings.WaypointDownload = false;
-        Settings.WaypointUpload = false;
-        Lang.Load(fakeCoreServerApi.Logger, fakeCoreServerApi.Assets);
-
-        SQLitePCL.Batteries.Init();
-
-    }
-
     [Test]
-    public void WriteMapDataToDb()
+    public async Task ReturnFromTheUploadHandlerWhileSqlIsLockedAndAcknowledgeOnlyAfterCommit()
     {
-        packets.ForEach(packet =>
+        SQLitePCL.Batteries_V2.Init();
+        string root = Directory.CreateTempSubdirectory("KctServerTransfer-").FullName;
+        var api = Substitute.For<ICoreServerAPI>();
+        var world = Substitute.For<IServerWorldAccessor>();
+        api.World.Returns(world);
+        ((ICoreAPI)api).World.Returns(world);
+        api.Side.Returns(EnumAppSide.Server);
+        var logger = Substitute.For<ILogger>();
+        api.Logger.Returns(logger); world.Logger.Returns(logger);
+        world.SavegameIdentifier.Returns(root);
+        api.GetOrCreateDataPath(Arg.Any<string>()).Returns(root);
+        Settings.Init(api, "test"); Settings.Load();
+        // This headless test has no language assets; immersive mode suppresses
+        // chat while retaining the real transfer, database and metadata paths.
+        Settings.ImmersiveMode = true;
+        var callbacks = new ConcurrentQueue<Action>();
+        api.Event.When(e => e.EnqueueMainThreadTask(Arg.Any<Action>(), Arg.Any<string>()))
+            .Do(call => callbacks.Enqueue(call.Arg<Action>()));
+        var channel = Substitute.For<IServerNetworkChannel>();
+        channel.RegisterMessageType<MapSyncPacket>().Returns(channel);
+        channel.RegisterMessageType<MapTransferAck>().Returns(channel);
+        channel.RegisterMessageType<MapDownloadRequest>().Returns(channel);
+        channel.RegisterMessageType<KctCommandPacket>().Returns(channel);
+        api.Network.RegisterChannel(Arg.Any<string>()).Returns(channel);
+        api.Network.GetChannel(Arg.Any<string>()).Returns(channel);
+        var acknowledgements = new List<MapTransferAck>();
+        var downloads = new List<MapSyncPacket>();
+        channel.When(c => c.SendPacket(Arg.Any<MapTransferAck>(), Arg.Any<IServerPlayer[]>()))
+            .Do(call => acknowledgements.Add(call.Arg<MapTransferAck>()));
+        channel.When(c => c.SendPacket(Arg.Any<MapSyncPacket>(), Arg.Any<IServerPlayer[]>()))
+            .Do(call => downloads.Add(call.Arg<MapSyncPacket>()));
+        var player = Substitute.For<IServerPlayer>();
+        player.PlayerUID.Returns("alice");
+        player.Entity.Returns(new EntityPlayer());
+        var table = new BlockEntityCartographyTable
         {
-            serverCartographyService.OnMapUploadRequest(fakePlayer1, packet);
-        });
-
-        Assert.That(fakeBlockEntity.Map?.ExploredAreasIds, Is.Not.Null);
-        Assert.That(fakeBlockEntity.Map?.ExploredAreasIds, Is.EqualTo(chunkIds));
-    }
-
-    [Test]
-    public void SendMapDataToClient()
-    {
-        packets.ForEach(packet =>
+            Api = api, Side = EnumAppSide.Server, Pos = new BlockPos(0, 0, 0),
+            Block = new BlockAdvancedCartographyTable { BlockId = 123 }, Map = new CartographyMap(api)
+        };
+        world.BlockAccessor.GetBlockEntity(table.Pos).Returns(table);
+        var service = new ServerCartographyService(api);
+        string id = Guid.NewGuid().ToString();
+        string path = Path.Combine(root, CartographyTableConstants.MOD_ID, "123.db");
+        var handler = typeof(ServerCartographyService).GetMethod("OnMapUploadRequest", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        void Receive(int sequence, int x, bool final = false) => handler.Invoke(service, [player,
+            new MapSyncPacket(final ? [] : new() { [new(x, 20)] = new() { Pixels = Enumerable.Repeat(x, 1024).ToArray() } },
+                table.Block, table.Pos, final, null, false) { SessionId = id, Sequence = sequence }]);
+        async Task PumpUntil(Func<bool> predicate)
         {
-            serverCartographyService.OnMapUploadRequest(fakePlayer1, packet);
-        });
-        
-        serverCartographyService.StartCartographyDownloadSession(CartographyAction.DownloadMap, fakeCoreServerApi.World, fakePlayer2, fakeTable, fakeBlockEntity.Pos, fakeBlockEntity);
-        float seconds = 0.0f;
-        while (seconds < 1.5)
-        {
-            seconds += 0.1f;
-            serverCartographyService.ContinueCartographyDownloadSession(fakePlayer2, seconds, fakeTable, fakeBlockEntity);
+            var timer = Stopwatch.StartNew();
+            while (!predicate() && timer.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                while (callbacks.TryDequeue(out var callback)) callback();
+                await Task.Delay(10);
+            }
+            Assert.That(predicate(), Is.True, "No commit acknowledgement arrived.");
         }
-        MapTransferSession downloadSession = serverCartographyService.GetMapTransferSession(fakePlayer2, fakeTable);
-        Assert.That(downloadSession.IsComplete, Is.True);
-        Assert.That(downloadSession.SentChunkCount, Is.EqualTo(chunkIds.Count));
-        serverCartographyService.EndCartographyDownloadSession(fakePlayer2, fakeTable, fakeBlockEntity);
-    }
+        try
+        {
+            Receive(0, 10);
+            Assert.That(acknowledgements, Is.Empty, "Receiving a packet is not a commit.");
+            await PumpUntil(() => acknowledgements.Count == 1);
+            Assert.That(acknowledgements[0].Success, Is.True, acknowledgements[0].Error);
+            using (var competingWriter = new SqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                competingWriter.Open();
+                using var transaction = competingWriter.BeginTransaction();
+                var timer = Stopwatch.StartNew();
+                Receive(1, 11);
+                Assert.That(timer.ElapsedMilliseconds, Is.LessThan(1000), "The interaction handler must not wait for a SQLite writer.");
+                await Task.Delay(100);
+                while (callbacks.TryDequeue(out var callback)) callback();
+                Assert.That(acknowledgements, Has.Count.EqualTo(1), "The second packet cannot be acknowledged while the write lock is held.");
+                transaction.Commit();
+            }
+            await PumpUntil(() => acknowledgements.Count == 2);
+            Assert.That(acknowledgements[1].Success, Is.True, acknowledgements[1].Error);
+            Receive(2, 0, final: true);
+            await PumpUntil(() => acknowledgements.Count == 3);
+            Assert.That(acknowledgements[2].Success, Is.True, acknowledgements[2].Error);
+            Assert.That(table.Map.ExploredAreasIds, Has.Count.EqualTo(2), "Final table metadata must include both committed packets.");
+            using var reader = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
+            reader.Open();
+            using var command = reader.CreateCommand();
+            command.CommandText = "SELECT COUNT(*) FROM mappiece";
+            Assert.That(Convert.ToInt32(command.ExecuteScalar()), Is.EqualTo(2));
 
-    [TearDown]
-    public void CleanUp()
-    {
-        serverCartographyService.Dispose();
-        string path =  Path.Combine(
-            GamePaths.DataPath,
-            "ModData",
-            fakeCoreServerApi.World.SavegameIdentifier
-        );
-        Directory.Delete(path, true);
+            // The same uploader returns with no local IDs. Exercise the real
+            // request handler, not just the SQL query used by the new handshake.
+            string downloadId = Guid.NewGuid().ToString();
+            var requestHandler = typeof(ServerCartographyService).GetMethod("OnDownloadRequest", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var ackHandler = typeof(ServerCartographyService).GetMethod("OnDownloadAck", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            requestHandler.Invoke(service, [player, new MapDownloadRequest
+            { SessionId=downloadId, BlockId="123", Position=table.Pos, KnownIds=[], IncludeWaypoints=false }]);
+            await PumpUntil(() => downloads.Count == 1);
+            Assert.That(downloads[0].Pieces, Has.Count.EqualTo(2));
+            Assert.That(downloads[0].IsFinalBatch, Is.True);
+            Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.True,
+                "Sending the final batch must not finish before client persistence.");
+            ackHandler.Invoke(service, [player, new MapTransferAck { SessionId=downloadId, Sequence=1, Success=true }]);
+            Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.True);
+            ackHandler.Invoke(service, [player, new MapTransferAck { SessionId=downloadId, Sequence=0, Success=true }]);
+            Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.False);
+
+            string cancelledId = Guid.NewGuid().ToString();
+            requestHandler.Invoke(service, [player, new MapDownloadRequest
+            { SessionId=cancelledId, BlockId="123", Position=table.Pos, KnownIds=[], IncludeWaypoints=false }]);
+            requestHandler.Invoke(service, [player, new MapDownloadRequest { SessionId=cancelledId, Cancelled=true }]);
+            await PumpUntil(() => downloads.Count == 2);
+            Assert.That(downloads[1].Cancelled, Is.True);
+            Assert.That(downloads[1].Pieces, Is.Empty, "Cancellation while preparing must not start reading/sending terrain.");
+            ackHandler.Invoke(service, [player, new MapTransferAck { SessionId=cancelledId, Sequence=0, Success=true }]);
+            Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.False);
+        }
+        finally
+        {
+            Settings.ImmersiveMode = false;
+            service.Dispose();
+            var worker = typeof(ServerCartographyService).GetField("worker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service)!;
+            var completion = (Task)worker.GetType().GetProperty("Completion", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(worker)!;
+            await completion.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.That(Path.GetDirectoryName(Path.GetFullPath(root)), Is.EqualTo(Path.TrimEndingDirectorySeparator(Path.GetTempPath())));
+            Directory.Delete(root, true);
+        }
     }
 }

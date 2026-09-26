@@ -37,6 +37,8 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
         }
         private readonly Dictionary<string, (CartographyAction action, long timestamp)> recentInteractions = [];
         private const long INTERACTION_GRACE_MS = 500;
+        private long nextSerializationLogAt;
+        private int serializationsSinceSample;
 
         public override void Initialize(ICoreAPI api)
         {
@@ -112,12 +114,28 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
         public override void ToTreeAttributes(ITreeAttribute tree)
         {
+            using var timing = CartographyPerformanceTrace.Start(Api, "blockentity.serialize");
             base.ToTreeAttributes(tree);
             Map?.Serialize(tree);
+            if (timing != null)
+            {
+                serializationsSinceSample++;
+                timing.Detail($"pos={Pos} ids={Map?.ExploredAreasIds.Count ?? 0} idsJsonChars={tree.GetString("ExploredAreasIds")?.Length ?? 0} writing={Map?.IsWriting} callsSinceSample={serializationsSinceSample}");
+                // This also runs for saving. It measures building the attributes,
+                // not the engine's later packet encoding or socket transmission.
+                if (Environment.TickCount64 >= nextSerializationLogAt)
+                {
+                    timing.AlwaysLog = true;
+                    nextSerializationLogAt = Environment.TickCount64 + 5000;
+                    serializationsSinceSample = 0;
+                }
+            }
         }
 
         public override void FromTreeAttributes(ITreeAttribute tree, IWorldAccessor worldForResolving)
         {
+            using var timing = CartographyPerformanceTrace.Start(Api, "blockentity.deserialize");
+            timing?.Detail($"pos={Pos} idsJsonChars={tree.GetString("ExploredAreasIds")?.Length ?? 0}");
             base.FromTreeAttributes(tree, worldForResolving);
             EnsureMap();
             bool wasWiping = Map.IsWiping;
@@ -163,10 +181,10 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
             return Map.GetPlayerLastSync(forPlayer);
         }
 
-        internal void SetPlayerSyncToNow(IPlayer player)
+        internal void SetPlayerSyncToNow(IPlayer player, DateTime? at = null)
         {
             EnsureMap();
-            Map.SetPlayerLastSync(player);
+            Map.SetPlayerLastSync(player, at);
             MarkDirty();
         }
 
@@ -186,6 +204,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 {
                     KsCartographyTableModSystem.ServerCartographyService.StartCartographyDownloadSession(action, world, byPlayer, Block, blockSel.Position, this);
                 }
+                else KsCartographyTableModSystem.ClientCartographyService.StartDownload(this);
                 
                 return true;
             }
@@ -230,6 +249,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 {
                     KsCartographyTableModSystem.ServerCartographyService.EndCartographyDownloadSession(byPlayer, world.BlockAccessor.GetBlock(blockSel.Position), this);
                 }
+                else KsCartographyTableModSystem.ClientCartographyService.StopDownload(this);
             }
         }
 
@@ -346,6 +366,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
             {
                 KsCartographyTableModSystem.ClientCartographyService.EndCartographyUploadSession(byPlayer, blockCartographyTable, this);
             }
+            if (Side == EnumAppSide.Client) KsCartographyTableModSystem.ClientCartographyService.StopDownload(this);
             if (Side == EnumAppSide.Server && KsCartographyTableModSystem.ServerCartographyService.HasCartographyDownloadSession(byPlayer, blockCartographyTable))
             {
                 KsCartographyTableModSystem.ServerCartographyService.EndCartographyDownloadSession(byPlayer, blockCartographyTable, this);

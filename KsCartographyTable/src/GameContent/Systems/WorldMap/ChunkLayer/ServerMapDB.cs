@@ -31,6 +31,15 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		[ProtoMember(6)]
 		public bool IncludeWaypoints { get; set; }
+
+        [ProtoMember(7)]
+        public string SessionId { get; set; } = "";
+
+        [ProtoMember(8)]
+        public int Sequence { get; set; }
+
+        [ProtoMember(9)]
+        public bool Cancelled { get; set; }
 		public MapSyncPacket() { }
 
 		public MapSyncPacket(Dictionary<FastVec2i, MapPieceDB> pieces, Block block, BlockPos blockPos) 
@@ -54,9 +63,13 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 		}
 	}
 
+    public sealed record MapReadBatch(Dictionary<FastVec2i, MapPieceDB> Pieces, long? LastPosition, bool Complete);
+
 	public class ServerMapDB : MapDB
 	{
 		SqliteCommand getAllMapPiecesCmd;
+		SqliteCommand setUploadedMapPieceCmd;
+		SqliteCommand getAllMapPieceIdsCmd;
 		SqliteCommand setPlayerExploredMapPieceCmd;
 		SqliteCommand getNewMapPiecesForPlayerCmd;
 		SqliteCommand getMapPieceWithPosCmd;
@@ -70,7 +83,12 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 		SqliteCommand getDeletedWaypointsForPlayerCmd;
 		SqliteCommand getWaypointsToDeleteCmd;
 		ICoreAPI coreApi;
-		public ServerMapDB(ICoreAPI coreApi) : base(coreApi.World.Logger)
+		public ServerMapDB(ICoreAPI coreApi) : this(coreApi, coreApi.World.Logger)
+		{
+		}
+
+        // Capture the logger on the game thread before constructing a worker-owned DB.
+        public ServerMapDB(ICoreAPI coreApi, ILogger logger) : base(logger)
 		{
 			this.coreApi = coreApi;
 		}
@@ -84,6 +102,10 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 			getAllMapPiecesCmd.CommandText = "SELECT position, data FROM mappiece";
 			getAllMapPiecesCmd.Prepare();
 
+			getAllMapPieceIdsCmd = sqliteConn.CreateCommand();
+			getAllMapPieceIdsCmd.CommandText = "SELECT position FROM mappiece";
+			getAllMapPieceIdsCmd.Prepare();
+
 			getMapPieceWithPosCmd = sqliteConn.CreateCommand();
 			getMapPieceWithPosCmd.CommandText = "SELECT position, data FROM mappiece WHERE position=@pos";
 			getMapPieceWithPosCmd.Parameters.Add("@pos", SqliteType.Integer, 1);
@@ -92,6 +114,12 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 			if (coreApi.Side == EnumAppSide.Server)
 			{
+                setUploadedMapPieceCmd = sqliteConn.CreateCommand();
+                setUploadedMapPieceCmd.CommandText = "INSERT OR REPLACE INTO mappiece (position, data) VALUES (@pos, @data)";
+                setUploadedMapPieceCmd.Parameters.Add("@pos", SqliteType.Integer);
+                setUploadedMapPieceCmd.Parameters.Add("@data", SqliteType.Blob);
+                setUploadedMapPieceCmd.Prepare();
+
 				setPlayerExploredMapPieceCmd = sqliteConn.CreateCommand();
 				setPlayerExploredMapPieceCmd.CommandText = "INSERT OR IGNORE INTO playerchunkmapping (position, playerId) VALUES (@pos, @uid)";
 				setPlayerExploredMapPieceCmd.Parameters.Add("@uid", SqliteType.Text);
@@ -202,6 +230,34 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 				using SqliteCommand sqliteCommand5 = sqliteConn.CreateCommand();
 				sqliteCommand5.CommandText = "CREATE TABLE IF NOT EXISTS sharedwaypoints (guid text NOT NULL, parentGuid text, owningPlayerUid text NOT NULL, position text NOT NULL, title text NOT NULL, icon text NOT NULL, color integer NOT NULL, pinned integer NOT NULL, deleted integer NOT NULL, lastUpdated integer NOT NULL, PRIMARY KEY (guid));";
 				sqliteCommand5.ExecuteNonQuery();
+
+                // The integer primary key lives alongside large pixel BLOBs. A
+                // narrow covering index avoids reading those table pages for ID scans.
+                // Server database opening is owned by the database worker.
+                using var mapIndex = sqliteConn.CreateCommand();
+                mapIndex.CommandText = "CREATE INDEX IF NOT EXISTS idx_mappiece_position ON mappiece(position)";
+                mapIndex.ExecuteNonQuery();
+
+                // Uploads revisit every historical deletion. Without a parent index,
+                // WHERE guid=@guid OR parentGuid=@guid scans the whole table even
+                // when the guid no longer exists. This also indexes child propagation.
+                using var indexTrace = CartographyPerformanceTrace.Start(coreApi, "db.waypoint-indexes");
+                indexTrace?.Detail("trigger=database-open action=create-if-missing");
+                if (indexTrace != null) indexTrace.AlwaysLog = true;
+                using var indexes = sqliteConn.CreateCommand();
+                indexes.CommandText = "CREATE INDEX IF NOT EXISTS idx_sharedwaypoints_parent ON sharedwaypoints(parentGuid, owningPlayerUid)";
+                indexes.ExecuteNonQuery();
+                indexTrace?.Mark("parent");
+
+                // A new waypoint is matched only against live root waypoints, by
+                // these exact fields. Keep the query's existing matching semantics.
+                indexes.CommandText = "CREATE INDEX IF NOT EXISTS idx_sharedwaypoints_match ON sharedwaypoints(position, title, icon, pinned) WHERE parentGuid IS NULL AND deleted=0";
+                indexes.ExecuteNonQuery();
+                indexTrace?.Mark("matching");
+
+                indexes.CommandText = "CREATE INDEX IF NOT EXISTS idx_sharedwaypoints_owner ON sharedwaypoints(owningPlayerUid, deleted, lastUpdated)";
+                indexes.ExecuteNonQuery();
+                indexTrace?.Mark("owner");
 			}
 		}
 
@@ -266,7 +322,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 		public List<FastVec2i> GetAllMapPiecesIds()
 		{
 			var ids = new List<FastVec2i>();
-			using var sqlite_datareader = getAllMapPiecesCmd.ExecuteReader();
+			using var sqlite_datareader = getAllMapPieceIdsCmd.ExecuteReader();
 			while (sqlite_datareader.Read())
 			{
 				ulong chunkId = Convert.ToUInt64(sqlite_datareader["position"]);
@@ -277,6 +333,54 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 			return ids;
 		}
 
+        /// <summary>
+        /// Read a bounded download batch using the client's actual known chunk IDs.
+        /// Scan only the compact position index and fetch pixels for missing chunks.
+        /// The cursor advances over excluded rows too, avoiding repeated prefix scans.
+        /// </summary>
+        public MapReadBatch ReadMapBatch(HashSet<ulong> excludedIds, long? afterPosition, int maximumPieces = 25)
+        {
+            ArgumentNullException.ThrowIfNull(excludedIds);
+            if (maximumPieces < 1 || maximumPieces > 256) throw new ArgumentOutOfRangeException(nameof(maximumPieces));
+            const int pageSize = 256;
+            var pieces = new Dictionary<FastVec2i, MapPieceDB>();
+            long? cursor = afterPosition;
+            using var positionsCommand = sqliteConn.CreateCommand();
+            while (true)
+            {
+                positionsCommand.CommandText = cursor.HasValue
+                    ? "SELECT position FROM mappiece WHERE position>@after ORDER BY position LIMIT @limit"
+                    : "SELECT position FROM mappiece ORDER BY position LIMIT @limit";
+                positionsCommand.Parameters.Clear();
+                if (cursor.HasValue) positionsCommand.Parameters.AddWithValue("@after", cursor.Value);
+                positionsCommand.Parameters.AddWithValue("@limit", pageSize);
+                var positions = new List<long>(pageSize);
+                using (var reader = positionsCommand.ExecuteReader())
+                {
+                    while (reader.Read()) positions.Add(reader.GetInt64(0));
+                }
+                for (int index = 0; index < positions.Count; index++)
+                {
+                    cursor = positions[index];
+                    ulong id = unchecked((ulong)cursor.Value);
+                    if (excludedIds.Contains(id)) continue;
+                    getMapPieceWithPosCmd.Parameters["@pos"].Value = cursor.Value;
+                    using (var reader = getMapPieceWithPosCmd.ExecuteReader())
+                    {
+                        if (reader.Read() && reader["data"] is byte[] bytes)
+                        {
+                            pieces.Add(ChunkIdToFastVect2i(id), SerializerUtil.Deserialize<MapPieceDB>(bytes));
+                        }
+                    }
+                    if (pieces.Count == maximumPieces)
+                    {
+                        return new MapReadBatch(pieces, cursor, index == positions.Count - 1 && positions.Count < pageSize);
+                    }
+                }
+                if (positions.Count < pageSize) return new MapReadBatch(pieces, cursor, true);
+            }
+        }
+
 		public int GetMapPieceCount()
 		{
 			using var cmd = sqliteConn.CreateCommand();
@@ -286,6 +390,11 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public void SetMapPiecesForPlayer(Dictionary<FastVec2i, MapPieceDB> pieces, IPlayer player)
 		{
+            SetMapPiecesForPlayer(pieces, player.PlayerUID);
+        }
+
+        public void SetMapPiecesForPlayer(Dictionary<FastVec2i, MapPieceDB> pieces, string playerUid)
+		{
 			using (SqliteTransaction sqliteTransaction = sqliteConn.BeginTransaction())
 			{
 				setPlayerExploredMapPieceCmd.Transaction = sqliteTransaction;
@@ -293,7 +402,7 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 				{
 					var chunkIndex = piece.Key.ToChunkIndex();
 					setPlayerExploredMapPieceCmd.Parameters["@pos"].Value = chunkIndex;
-					setPlayerExploredMapPieceCmd.Parameters["@uid"].Value = player.PlayerUID;
+					setPlayerExploredMapPieceCmd.Parameters["@uid"].Value = playerUid;
 					setPlayerExploredMapPieceCmd.ExecuteNonQuery();
 				}
 
@@ -301,11 +410,55 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 			}
 		}
 
+        // One atomic packet write: pixels and the player's known-chunk mapping are
+        // committed together. Serialization happens before the write transaction so
+        // CPU work does not unnecessarily hold SQLite's write lock.
+        public void StoreMapPieces(Dictionary<FastVec2i, MapPieceDB> pieces, string playerUid)
+        {
+            ArgumentNullException.ThrowIfNull(pieces);
+            ArgumentException.ThrowIfNullOrEmpty(playerUid);
+            if (pieces.Count == 0) return;
+            using var timing = CartographyPerformanceTrace.Start(coreApi, "upload.store-worker");
+            timing?.Detail($"pieces={pieces.Count}");
+            var serialized = new List<KeyValuePair<ulong, byte[]>>(pieces.Count);
+            long bytes = 0;
+            foreach (var piece in pieces)
+            {
+                var data = SerializerUtil.Serialize(piece.Value);
+                serialized.Add(new(piece.Key.ToChunkIndex(), data));
+                bytes += data.Length;
+            }
+            timing?.Mark("serialize");
+            timing?.Detail($"bytes={bytes}");
+
+            using var transaction = sqliteConn.BeginTransaction();
+            timing?.Mark("begin");
+            setUploadedMapPieceCmd.Transaction = transaction;
+            setPlayerExploredMapPieceCmd.Transaction = transaction;
+            setPlayerExploredMapPieceCmd.Parameters["@uid"].Value = playerUid;
+            foreach (var piece in serialized)
+            {
+                setUploadedMapPieceCmd.Parameters["@pos"].Value = piece.Key;
+                setUploadedMapPieceCmd.Parameters["@data"].Value = piece.Value;
+                setUploadedMapPieceCmd.ExecuteNonQuery();
+                setPlayerExploredMapPieceCmd.Parameters["@pos"].Value = piece.Key;
+                setPlayerExploredMapPieceCmd.ExecuteNonQuery();
+            }
+            timing?.Mark("execute");
+            transaction.Commit();
+            timing?.Mark("commit");
+        }
+
 		public Dictionary<FastVec2i, MapPieceDB> GetNewMapPiecesForPlayer(IPlayer player)
+		{
+            return GetNewMapPiecesForPlayer(player.PlayerUID);
+        }
+
+        public Dictionary<FastVec2i, MapPieceDB> GetNewMapPiecesForPlayer(string playerUid)
 		{
 			Dictionary<FastVec2i, MapPieceDB> pieces = [];
 
-			getNewMapPiecesForPlayerCmd.Parameters["@uid"].Value = player.PlayerUID;
+			getNewMapPiecesForPlayerCmd.Parameters["@uid"].Value = playerUid;
 			using (var reader = getNewMapPiecesForPlayerCmd.ExecuteReader())
 			{
 				while (reader.Read())
@@ -323,11 +476,13 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public void CreateWaypoints(List<CartographyWaypoint> waypoints)
 		{
+            if (waypoints.Count == 0) return;
+            using var trace = CartographyPerformanceTrace.Start(coreApi, "waypoints.create");
+            trace?.Detail($"count={waypoints.Count}");
             using SqliteTransaction sqliteTransaction = sqliteConn.BeginTransaction();
             createWaypointsCmd.Transaction = sqliteTransaction;
             foreach (CartographyWaypoint waypoint in waypoints)
             {
-                KsCartographyTableModSystem.DebugLog(coreApi, $"INSERTING guid={waypoint.Guid}, title={waypoint.Title}, parentGuid={waypoint.ParentGuid ?? "null"}");
                 createWaypointsCmd.Parameters["@guid"].Value = waypoint.Guid;
                 createWaypointsCmd.Parameters["@parentGuid"].Value = string.IsNullOrEmpty(waypoint.ParentGuid) ? DBNull.Value : waypoint.ParentGuid;
                 createWaypointsCmd.Parameters["@owningPlayerUid"].Value = waypoint.OwningPlayerUid;
@@ -345,12 +500,14 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public void UpdateWaypoints(List<CartographyWaypoint> waypoints)
 		{
+            if (waypoints.Count == 0) return;
+            using var trace = CartographyPerformanceTrace.Start(coreApi, "waypoints.update");
+            trace?.Detail($"count={waypoints.Count}");
 			using (SqliteTransaction sqliteTransaction = sqliteConn.BeginTransaction())
 			{
 				updateWaypointsCmd.Transaction = sqliteTransaction;
 				foreach (CartographyWaypoint waypoint in waypoints)
 				{
-            		KsCartographyTableModSystem.DebugLog(coreApi, $"UPDATING guid={waypoint.Guid}, title={waypoint.Title}, parentGuid={waypoint.ParentGuid ?? "null"}");
 					updateWaypointsCmd.Parameters["@guid"].Value = string.IsNullOrEmpty(waypoint.ParentGuid) ? waypoint.Guid : waypoint.ParentGuid;
 					updateWaypointsCmd.Parameters["@title"].Value = waypoint.Title;
 					updateWaypointsCmd.Parameters["@icon"].Value = waypoint.Icon;
@@ -366,9 +523,14 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public List<CartographyWaypoint> GetPlayerSharedWaypoints(IPlayer player)
 		{
+            return GetPlayerSharedWaypoints(player.PlayerUID);
+        }
+
+        public List<CartographyWaypoint> GetPlayerSharedWaypoints(string playerUid)
+		{
 			List<CartographyWaypoint> waypoints = [];
 
-			getPlayerWaypointsCmd.Parameters["@owningPlayerUid"].Value = player.PlayerUID;
+			getPlayerWaypointsCmd.Parameters["@owningPlayerUid"].Value = playerUid;
 			using (var reader = getPlayerWaypointsCmd.ExecuteReader())
 			{
 				while (reader.Read())
@@ -393,9 +555,14 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public List<CartographyWaypoint> GetNewWaypointsForPlayer(IPlayer player)
 		{
+            return GetNewWaypointsForPlayer(player.PlayerUID);
+        }
+
+        public List<CartographyWaypoint> GetNewWaypointsForPlayer(string playerUid)
+		{
 			List<CartographyWaypoint> waypoints = [];
 
-			getNewWaypointsForPlayerCmd.Parameters["@owningPlayerUid"].Value = player.PlayerUID;
+			getNewWaypointsForPlayerCmd.Parameters["@owningPlayerUid"].Value = playerUid;
 			using (var reader = getNewWaypointsForPlayerCmd.ExecuteReader())
 			{
 				while (reader.Read())
@@ -420,9 +587,14 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public List<CartographyWaypoint> GetUpdatedWaypointsForPlayer(IPlayer player, DateTime lastUpdated)
 		{
+            return GetUpdatedWaypointsForPlayer(player.PlayerUID, lastUpdated);
+        }
+
+        public List<CartographyWaypoint> GetUpdatedWaypointsForPlayer(string playerUid, DateTime lastUpdated)
+		{
 			List<CartographyWaypoint> waypoints = [];
 
-			getUpdatedWaypointsForPlayerCmd.Parameters["@owningPlayerUid"].Value = player.PlayerUID;
+			getUpdatedWaypointsForPlayerCmd.Parameters["@owningPlayerUid"].Value = playerUid;
 			getUpdatedWaypointsForPlayerCmd.Parameters["@lastUpdated"].Value = ((DateTimeOffset)lastUpdated.ToUniversalTime()).ToUnixTimeMilliseconds();
 			using (var reader = getUpdatedWaypointsForPlayerCmd.ExecuteReader())
 			{
@@ -448,9 +620,14 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		public List<CartographyWaypoint> GetDeletedWaypointsForPlayer(IPlayer player, DateTime lastUpdated)
 		{
+            return GetDeletedWaypointsForPlayer(player.PlayerUID, lastUpdated);
+        }
+
+        public List<CartographyWaypoint> GetDeletedWaypointsForPlayer(string playerUid, DateTime lastUpdated)
+		{
 			List<CartographyWaypoint> waypoints = [];
 
-			getDeletedWaypointsForPlayerCmd.Parameters["@owningPlayerUid"].Value = player.PlayerUID;
+			getDeletedWaypointsForPlayerCmd.Parameters["@owningPlayerUid"].Value = playerUid;
 			getDeletedWaypointsForPlayerCmd.Parameters["@lastUpdated"].Value = ((DateTimeOffset)lastUpdated.ToUniversalTime()).ToUnixTimeMilliseconds();
 			using (var reader = getDeletedWaypointsForPlayerCmd.ExecuteReader())
 			{
@@ -593,7 +770,9 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
 
 		private void DisposeAllCmds()
 		{			
+			setUploadedMapPieceCmd?.Dispose();
 			getAllMapPiecesCmd?.Dispose();
+			getAllMapPieceIdsCmd?.Dispose();
 			setPlayerExploredMapPieceCmd?.Dispose();
 			getNewMapPiecesForPlayerCmd?.Dispose();
 			getMapPieceWithPosCmd?.Dispose();

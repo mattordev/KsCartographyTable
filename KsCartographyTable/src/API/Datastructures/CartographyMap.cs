@@ -317,9 +317,9 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
                 .LocalDateTime;
         }
 
-        internal void SetPlayerLastSync(IPlayer forPlayer)
+        internal void SetPlayerLastSync(IPlayer forPlayer, DateTime? at = null)
         {
-            long now = ((DateTimeOffset)DateTime.Now.ToUniversalTime()).ToUnixTimeMilliseconds();
+            long now = ((DateTimeOffset)(at ?? DateTime.Now).ToUniversalTime()).ToUnixTimeMilliseconds();
             if (LastPlayerSyncs.TryAdd(forPlayer.PlayerUID, now))
             {
                 return;
