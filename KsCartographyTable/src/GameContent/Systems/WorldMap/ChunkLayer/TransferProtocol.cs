@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using ProtoBuf;
 using Vintagestory.API.MathTools;
 
@@ -11,6 +12,9 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
         // ChunksPerPacket remains the requested count. This separate byte budget
         // prevents variable-sized map pieces from creating an unsafe wire packet.
         internal const int MaximumMapDataBytes = 512 * 1024;
+        // Keep individual wire packets small, but amortize SQLite's durable commit
+        // across a few packets. Four packets cap the in-flight map data at 2 MiB.
+        internal const int UploadCommitGroupSize = 4;
         internal const int MaximumIds = 2_000_000;
         internal const double TimeoutSeconds = 120;
     }
@@ -35,27 +39,31 @@ namespace Kaisentlaia.KsCartographyTableMod.GameContent
         [ProtoMember(6)] public bool IncludeWaypoints { get; set; }
     }
 
-    // One outstanding packet keeps disk latency from becoming a network/work queue.
-    // Only an exact acknowledgement advances the session, including its final packet.
+    // Uploads use a small bounded window so the server can commit several safe-sized
+    // packets together. Downloads still use this as a one-packet window because their
+    // sender checks Waiting before reading the next batch.
     internal sealed class TransferWindow
     {
+        private readonly Queue<bool> pending = new();
+        private int nextSendSequence;
+        private bool finalQueued;
         internal int NextSequence { get; private set; }
-        internal bool Waiting { get; private set; }
+        internal bool Waiting => pending.Count > 0;
+        internal bool CanSend => !Complete && !finalQueued && pending.Count < TransferProtocol.UploadCommitGroupSize;
         internal bool Complete { get; private set; }
-        private bool final;
         internal bool TrySend(bool isFinal, out int sequence)
         {
-            sequence = NextSequence;
-            if (Waiting || Complete) return false;
-            Waiting = true;
-            final = isFinal;
+            sequence = nextSendSequence;
+            if (!CanSend) return false;
+            pending.Enqueue(isFinal);
+            finalQueued = isFinal;
+            nextSendSequence++;
             return true;
         }
         internal bool Acknowledge(int sequence)
         {
             if (!Waiting || sequence != NextSequence) return false;
-            Waiting = false;
-            Complete = final;
+            Complete = pending.Dequeue();
             NextSequence++;
             return true;
         }

@@ -88,6 +88,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             internal IServerPlayer Player;
             internal int Expected, Received;
             internal bool Pending;
+            internal readonly List<MapSyncPacket> Buffered = [];
             internal double LastActivity = Now;
         }
         sealed class Download
@@ -171,23 +172,38 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             }
             if (state.Uid != player.PlayerUID || state.Table != table || state.Pending || packet.Sequence != state.Expected) return;
             if (packet.Pieces.Values.Any(p => p?.Pixels == null || p.Pixels.Length != 1024))
-            { FailUpload(state, packet.Sequence, new InvalidDataException("Invalid map pixels")); return; }
+            {
+                int failedSequence = state.Buffered.Count == 0 ? packet.Sequence : state.Buffered[0].Sequence;
+                FailUpload(state, failedSequence, new InvalidDataException("Invalid map pixels")); return;
+            }
             var snapshot = packet.IsFinalBatch && packet.IncludeWaypoints && Settings.WaypointUpload
                 ? serverWaypointManager.Capture(player, table, true) : null;
             mainTrace?.Mark("validateAndSnapshot");
+            state.Buffered.Add(packet); state.Expected++; state.LastActivity = Now;
+            table.SetWriting(true);
+            if (!packet.IsFinalBatch && state.Buffered.Count < TransferProtocol.UploadCommitGroupSize) return;
+
+            MapSyncPacket[] batch = [.. state.Buffered];
+            state.Buffered.Clear();
             bool advanced = table.IsAdvanced;
-            int received = state.Received + (advanced ? packet.Pieces.Count : 0);
+            int batchPieces = batch.Sum(item => item.Pieces.Count);
+            int received = state.Received + (advanced ? batchPieces : 0);
             string uid = state.Uid, blockId = state.BlockId;
             double queued = Now;
-            state.Pending = true; state.LastActivity = Now;
-            table.SetWriting(true);
+            state.Pending = true;
             bool accepted = worker.TryEnqueue(dbSet =>
             {
                 using var timing = CartographyPerformanceTrace.Start(CoreServerAPI, "upload.worker");
-                timing?.Detail($"session={packet.SessionId} seq={packet.Sequence} pieces={packet.Pieces.Count} queueMs={(Now - queued) * 1000:F1} final={packet.IsFinalBatch}");
+                timing?.Detail($"session={packet.SessionId} seq={batch[0].Sequence}-{packet.Sequence} packets={batch.Length} pieces={batchPieces} queueMs={(Now - queued) * 1000:F1} final={packet.IsFinalBatch}");
                 if (timing != null) timing.AlwaysLog = packet.Sequence == 0 || packet.IsFinalBatch;
                 var db = dbSet.Get(blockId); timing?.Mark("open");
-                if (advanced && packet.Pieces.Count > 0) db.StoreMapPieces(packet.Pieces, uid);
+                if (advanced && batchPieces > 0)
+                {
+                    var combined = new Dictionary<FastVec2i, MapPieceDB>(batchPieces);
+                    foreach (var item in batch)
+                    foreach (var piece in item.Pieces) combined[piece.Key] = piece.Value;
+                    db.StoreMapPieces(combined, uid);
+                }
                 timing?.Mark("store");
                 if (!packet.IsFinalBatch) return new UploadResult(received, null, null, 0, null);
                 var waypoints = snapshot == null ? new WaypointSyncResult(0, 0, 0, 0) : serverWaypointManager.StoreTableWaypoints(snapshot, db);
@@ -198,8 +214,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
             }, result =>
             {
                 if (disposed || !uploads.TryGetValue(state.Id, out var current) || current != state) return;
-                state.Pending = false; state.Expected++; state.Received = result.Received; state.LastActivity = Now;
-                if (!Live(table)) { FailUpload(state, packet.Sequence, new IOException("Table removed during transfer")); return; }
+                state.Pending = false; state.Received = result.Received; state.LastActivity = Now;
+                if (!Live(table)) { FailUpload(state, batch[0].Sequence, new IOException("Table removed during transfer")); return; }
                 if (packet.IsFinalBatch)
                 {
                     using var publish = CartographyPerformanceTrace.Start(CoreServerAPI, "upload.publish-main");
@@ -209,10 +225,10 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Server
                     if (result.Ids != null) table.UpdateMapExploredAreasIds(result.Ids);
                     ReportUpload(packet, table, player, result);
                 }
-                Ack(player, state.Id, packet.Sequence);
-            }, error => FailUpload(state, packet.Sequence, error), packet.Pieces.Count * 16384L);
+                foreach (var acknowledged in batch) Ack(player, state.Id, acknowledged.Sequence);
+            }, error => FailUpload(state, batch[0].Sequence, error), batchPieces * 16384L);
             mainTrace?.Mark("enqueue");
-            if (!accepted) FailUpload(state, packet.Sequence, new IOException("Database queue is full"));
+            if (!accepted) FailUpload(state, batch[0].Sequence, new IOException("Database queue is full"));
         }
         void FailUpload(Upload state, int seq, Exception error)
         {

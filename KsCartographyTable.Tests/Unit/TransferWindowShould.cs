@@ -18,17 +18,20 @@ public class TransferWindowShould
     }
 
     [Test]
-    public void AllowOnlyOnePacketUntilItsExactCommitAcknowledgementArrives()
+    public void BoundOutstandingPacketsAndRequireOrderedCommitAcknowledgements()
     {
         var window = new TransferWindow();
-        Assert.That(window.TrySend(false, out int first), Is.True);
-        Assert.That(first, Is.Zero);
-        Assert.That(window.TrySend(false, out _), Is.False, "A slow disk must not build a packet backlog.");
+        for (int sequence = 0; sequence < TransferProtocol.UploadCommitGroupSize; sequence++)
+        {
+            Assert.That(window.TrySend(false, out int sent), Is.True);
+            Assert.That(sent, Is.EqualTo(sequence));
+        }
+        Assert.That(window.TrySend(false, out _), Is.False, "A slow disk must not create an unbounded packet backlog.");
         Assert.That(window.Acknowledge(1), Is.False, "Future acknowledgements cannot skip a write.");
         Assert.That(window.Waiting, Is.True);
         Assert.That(window.Acknowledge(0), Is.True);
-        Assert.That(window.TrySend(false, out int second), Is.True);
-        Assert.That(second, Is.EqualTo(1));
+        Assert.That(window.TrySend(false, out int next), Is.True);
+        Assert.That(next, Is.EqualTo(TransferProtocol.UploadCommitGroupSize));
         Assert.That(window.Acknowledge(0), Is.False, "A duplicate must not acknowledge the next write.");
         Assert.That(window.Waiting, Is.True);
     }
@@ -37,11 +40,12 @@ public class TransferWindowShould
     public void WaitForTheLastWriteBeforeFinalizingACancelledOrCompletedTransfer()
     {
         var window = new TransferWindow();
-        window.TrySend(false, out _);
-        Assert.That(window.TrySend(true, out _), Is.False);
-        window.Acknowledge(0);
+        Assert.That(window.TrySend(false, out int first), Is.True);
         Assert.That(window.TrySend(true, out int sequence), Is.True);
+        Assert.That(window.TrySend(false, out _), Is.False, "Nothing may be queued after the final packet.");
         Assert.That(window.Complete, Is.False, "Sending the final packet is not proof of persistence.");
+        Assert.That(window.Acknowledge(first), Is.True);
+        Assert.That(window.Complete, Is.False, "Earlier packets do not complete a window containing a final packet.");
         window.Acknowledge(sequence);
         Assert.That(window.Complete, Is.True);
         Assert.That(window.TrySend(true, out _), Is.False);

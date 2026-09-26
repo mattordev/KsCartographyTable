@@ -72,6 +72,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Client
             internal bool Stop, Released, IncludeWaypoints;
             internal double LastSend, LastActivity = Now, LastLog;
             internal int Sent;
+            internal readonly Dictionary<int, double> SentAt = [];
         }
         sealed class Download
         {
@@ -134,7 +135,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Client
         }
         void PumpUpload(Upload u)
         {
-            if (u.Window.Waiting || u.Window.Complete) return;
+            if (!u.Window.CanSend) return;
             if (!u.Stop && u.Source.Error is { } error) { AbortRead(u, error); return; }
             if (!u.Stop && Now - u.LastSend < Math.Max(0.05, Settings.PacketDelay)) return;
             Dictionary<FastVec2i, MapPieceDB> pieces = [];
@@ -147,6 +148,7 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Client
             }
             if (!u.Window.TrySend(final, out int sequence)) return;
             u.LastSend = u.LastActivity = Now; u.Sent += pieces.Count;
+            u.SentAt[sequence] = u.LastSend;
             var packet = new MapSyncPacket(pieces, u.Table.Block, u.Table.Pos.Copy(), final, null, final && u.IncludeWaypoints)
             { SessionId = u.Id, Sequence = sequence, Cancelled = u.Stop };
             using var trace = CartographyPerformanceTrace.Start(CoreClientAPI, "upload.send-main");
@@ -175,7 +177,8 @@ namespace Kaisentlaia.KsCartographyTableMod.API.Client
             if (download is { } d && ack.SessionId == d.Id && !ack.Success) { FailDownload(ack.Error); return; }
             if (upload is not { } u || ack.SessionId != u.Id || !u.Window.Waiting || ack.Sequence != u.Window.NextSequence) return;
             if (!ack.Success) { FailUpload(ack.Error); return; }
-            double ms = (Now - u.LastSend) * 1000;
+            double sentAt = u.SentAt.Remove(ack.Sequence, out double value) ? value : u.LastSend;
+            double ms = (Now - sentAt) * 1000;
             if (ms >= 100 && Now - u.LastLog > 5)
             { KsCartographyTableModSystem.DebugLog(CoreClientAPI, $"[perf] upload.ack session={u.Id} seq={ack.Sequence} roundTripMs={ms:F1}"); u.LastLog = Now; }
             u.Window.Acknowledge(ack.Sequence); u.LastActivity = Now;

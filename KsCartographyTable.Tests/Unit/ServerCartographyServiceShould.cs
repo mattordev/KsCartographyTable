@@ -83,33 +83,38 @@ public class ServerCartographyServiceShould
         }
         try
         {
-            Receive(0, 10);
+            for (int sequence = 0; sequence < TransferProtocol.UploadCommitGroupSize; sequence++)
+                Receive(sequence, 10 + sequence);
             Assert.That(acknowledgements, Is.Empty, "Receiving a packet is not a commit.");
-            await PumpUntil(() => acknowledgements.Count == 1);
+            await PumpUntil(() => acknowledgements.Count == TransferProtocol.UploadCommitGroupSize);
             Assert.That(acknowledgements[0].Success, Is.True, acknowledgements[0].Error);
             using (var competingWriter = new SqliteConnection($"Data Source={path};Pooling=False"))
             {
                 competingWriter.Open();
                 using var transaction = competingWriter.BeginTransaction();
                 var timer = Stopwatch.StartNew();
-                Receive(1, 11);
+                for (int offset = 0; offset < TransferProtocol.UploadCommitGroupSize; offset++)
+                    Receive(TransferProtocol.UploadCommitGroupSize + offset, 20 + offset);
                 Assert.That(timer.ElapsedMilliseconds, Is.LessThan(1000), "The interaction handler must not wait for a SQLite writer.");
                 await Task.Delay(100);
                 while (callbacks.TryDequeue(out var callback)) callback();
-                Assert.That(acknowledgements, Has.Count.EqualTo(1), "The second packet cannot be acknowledged while the write lock is held.");
+                Assert.That(acknowledgements, Has.Count.EqualTo(TransferProtocol.UploadCommitGroupSize),
+                    "The second commit group cannot be acknowledged while the write lock is held.");
                 transaction.Commit();
             }
-            await PumpUntil(() => acknowledgements.Count == 2);
-            Assert.That(acknowledgements[1].Success, Is.True, acknowledgements[1].Error);
-            Receive(2, 0, final: true);
-            await PumpUntil(() => acknowledgements.Count == 3);
-            Assert.That(acknowledgements[2].Success, Is.True, acknowledgements[2].Error);
-            Assert.That(table.Map.ExploredAreasIds, Has.Count.EqualTo(2), "Final table metadata must include both committed packets.");
+            int committedPackets = TransferProtocol.UploadCommitGroupSize * 2;
+            await PumpUntil(() => acknowledgements.Count == committedPackets);
+            Assert.That(acknowledgements[^1].Success, Is.True, acknowledgements[^1].Error);
+            Receive(committedPackets, 0, final: true);
+            await PumpUntil(() => acknowledgements.Count == committedPackets + 1);
+            Assert.That(acknowledgements[^1].Success, Is.True, acknowledgements[^1].Error);
+            Assert.That(table.Map.ExploredAreasIds, Has.Count.EqualTo(committedPackets),
+                "Final table metadata must include every committed packet.");
             using var reader = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
             reader.Open();
             using var command = reader.CreateCommand();
             command.CommandText = "SELECT COUNT(*) FROM mappiece";
-            Assert.That(Convert.ToInt32(command.ExecuteScalar()), Is.EqualTo(2));
+            Assert.That(Convert.ToInt32(command.ExecuteScalar()), Is.EqualTo(committedPackets));
 
             // The same uploader returns with no local IDs. Exercise the real
             // request handler, not just the SQL query used by the new handshake.
@@ -119,7 +124,7 @@ public class ServerCartographyServiceShould
             requestHandler.Invoke(service, [player, new MapDownloadRequest
             { SessionId=downloadId, BlockId="123", Position=table.Pos, KnownIds=[], IncludeWaypoints=false }]);
             await PumpUntil(() => downloads.Count == 1);
-            Assert.That(downloads[0].Pieces, Has.Count.EqualTo(2));
+            Assert.That(downloads[0].Pieces, Has.Count.EqualTo(committedPackets));
             Assert.That(downloads[0].IsFinalBatch, Is.True);
             Assert.That(service.HasCartographyDownloadSession(player, table.Block), Is.True,
                 "Sending the final batch must not finish before client persistence.");
