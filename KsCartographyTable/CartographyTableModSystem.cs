@@ -12,8 +12,20 @@ using Vintagestory.API.Config;
 namespace Kaisentlaia.KsCartographyTableMod.API.Common;
 
 [HarmonyPatch]
-public class KsCartographyTableModSystem(bool disableCommands = false, bool disableHarmony = false) : ModSystem
+public class KsCartographyTableModSystem : ModSystem
 {
+    private readonly bool disableCommands;
+    private readonly bool disableHarmony;
+
+    // Vintage Story creates ModSystem instances through a real parameterless
+    // constructor. Optional constructor parameters do not satisfy Activator.
+    public KsCartographyTableModSystem() : this(false, false) { }
+
+    public KsCartographyTableModSystem(bool disableCommands, bool disableHarmony)
+    {
+        this.disableCommands = disableCommands;
+        this.disableHarmony = disableHarmony;
+    }
 
     // TODO adjust collision boxes
     // TODO update it labels
